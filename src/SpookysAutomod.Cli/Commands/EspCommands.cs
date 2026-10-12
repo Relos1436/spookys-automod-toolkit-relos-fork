@@ -566,6 +566,7 @@ public static class EspCommands
         };
         var typeOption = new Option<string?>("--type", "New type: spell, power, lesser-power, or ability");
         var equipmentTypeOption = new Option<string?>("--equipment-type", "Equipment type FormKey (FORMID:MODNAME)");
+        var magicSkillOption = new Option<string?>("--magic-skill", "Set Magic Skill on each effect used by the spell (e.g. Alteration)");
 
         var cmd = new Command("update-spell", "Create an override patch changing fields on an existing spell")
         {
@@ -573,7 +574,8 @@ public static class EspCommands
             outputOption,
             editorIdOption,
             typeOption,
-            equipmentTypeOption
+            equipmentTypeOption,
+            magicSkillOption
         };
 
         cmd.SetHandler(context =>
@@ -583,12 +585,13 @@ public static class EspCommands
             var editorId = context.ParseResult.GetValueForOption(editorIdOption)!;
             var typeText = context.ParseResult.GetValueForOption(typeOption);
             var equipmentTypeText = context.ParseResult.GetValueForOption(equipmentTypeOption);
+            var magicSkillText = context.ParseResult.GetValueForOption(magicSkillOption);
             var json = context.ParseResult.GetValueForOption(_jsonOption);
             var verbose = context.ParseResult.GetValueForOption(_verboseOption);
 
-            if (string.IsNullOrWhiteSpace(typeText) && string.IsNullOrWhiteSpace(equipmentTypeText))
+            if (string.IsNullOrWhiteSpace(typeText) && string.IsNullOrWhiteSpace(equipmentTypeText) && string.IsNullOrWhiteSpace(magicSkillText))
             {
-                OutputError("Specify at least one of --type or --equipment-type.", json);
+                OutputError("Specify at least one of --type, --equipment-type, or --magic-skill.", json);
                 return;
             }
 
@@ -610,9 +613,22 @@ public static class EspCommands
                 }
             }
 
+            ActorValue? magicSkill = null;
+            if (!string.IsNullOrWhiteSpace(magicSkillText))
+            {
+                if (!Enum.TryParse<ActorValue>(magicSkillText.Trim(), true, out var parsedMagicSkill) ||
+                    !Enum.IsDefined(parsedMagicSkill) ||
+                    parsedMagicSkill is not (ActorValue.None or ActorValue.Alteration or ActorValue.Conjuration or ActorValue.Destruction or ActorValue.Illusion or ActorValue.Restoration))
+                {
+                    OutputError($"Unknown magic skill '{magicSkillText}'. Use None, Alteration, Conjuration, Destruction, Illusion, or Restoration.", json);
+                    return;
+                }
+                magicSkill = parsedMagicSkill;
+            }
+
             var logger = CreateLogger(json, verbose);
             var service = new PluginService(logger);
-            var result = service.UpdateSpell(source, output, editorId, spellType, equipmentTypeText);
+            var result = service.UpdateSpell(source, output, editorId, spellType, equipmentTypeText, magicSkill);
 
             if (json)
             {

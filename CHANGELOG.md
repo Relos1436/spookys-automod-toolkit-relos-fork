@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`esp update-spell`** creates a separate ESL override patch for changing an existing spell's type and/or equipment type while preserving its other fields. It keeps the source plugin read-only, carries over its master chain, and refuses to overwrite an existing output file.
+- **`esp update-spell`** creates a separate ESL override patch for changing a spell's type and/or equipment type, and can set the Magic Skill school on each distinct Magic Effect defined in the source plugin. It includes those effect overrides in the same patch, preserves other fields, keeps the source read-only, carries over its master chain, and refuses to overwrite an existing output file.
 
 - **`esp view-record` now supports `ConstructibleObject`** (`--type constructibleobject`, aliases
   `cobj`/`recipe`) - previously `add-recipe` could create crafting recipes but nothing could

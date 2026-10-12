@@ -1850,15 +1850,16 @@ public class PluginService
         string outputPluginPath,
         string editorId,
         SpellType? spellType = null,
-        string? equipmentTypeFormKey = null)
+        string? equipmentTypeFormKey = null,
+        ActorValue? magicSkill = null)
     {
         try
         {
             if (!File.Exists(sourcePluginPath))
                 return Result<string>.Fail($"Source plugin not found: {sourcePluginPath}");
 
-            if (spellType == null && string.IsNullOrWhiteSpace(equipmentTypeFormKey))
-                return Result<string>.Fail("Specify at least one spell field to update: type or equipment type.");
+            if (spellType == null && string.IsNullOrWhiteSpace(equipmentTypeFormKey) && magicSkill == null)
+                return Result<string>.Fail("Specify at least one spell field to update: type, equipment type, or magic skill.");
 
             var sourcePath = Path.GetFullPath(sourcePluginPath);
             var outputPath = Path.GetFullPath(outputPluginPath);
@@ -1907,6 +1908,29 @@ public class PluginService
                 spellOverride.EquipmentType.SetTo(equipmentTypeKey);
             }
             patchMod.Spells.Add(spellOverride);
+
+            // Magic Skill belongs to MGEF records. Include overrides for each distinct
+            // effect used by this spell so the spell and its effect school are one patch.
+            if (magicSkill.HasValue)
+            {
+                var effectKeys = sourceSpell.Effects
+                    .Select(effect => effect.BaseEffect.FormKey)
+                    .Distinct()
+                    .ToList();
+                if (effectKeys.Count == 0)
+                    return Result<string>.Fail($"Spell has no magic effects to assign to {magicSkill.Value}.");
+
+                foreach (var effectKey in effectKeys)
+                {
+                    var sourceEffect = sourceMod.MagicEffects.FirstOrDefault(effect => effect.FormKey == effectKey);
+                    if (sourceEffect == null)
+                        return Result<string>.Fail($"Could not resolve spell magic effect {effectKey} in the source plugin.");
+
+                    var effectOverride = (MagicEffect)sourceEffect.DeepCopy();
+                    effectOverride.MagicSkill = magicSkill.Value;
+                    patchMod.MagicEffects.Add(effectOverride);
+                }
+            }
 
             var outputDirectory = Path.GetDirectoryName(outputPath);
             if (!string.IsNullOrEmpty(outputDirectory))

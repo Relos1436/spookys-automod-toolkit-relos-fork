@@ -122,7 +122,7 @@ dotnet build
 dotnet run --project src/SpookysAutomod.Cli -- <module> <command> [args] --json
 
 # Create a separate override patch while updating spell fields
-dotnet run --project src/SpookysAutomod.Cli -- esp update-spell <source> --output esp-workspace/output/<new-patch.esp> --editor-id <id> --type spell --equipment-type <FORMID:MODNAME>
+dotnet run --project src/SpookysAutomod.Cli -- esp update-spell <source> --output esp-workspace/output/<new-patch.esp> --editor-id <id> --type spell --equipment-type <FORMID:MODNAME> --magic-skill <school>
 
 # Run tests
 dotnet test

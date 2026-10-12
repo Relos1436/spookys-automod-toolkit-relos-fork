@@ -881,6 +881,7 @@ esp view-record <plugin> --editor-id <id> --type <type> --json
 esp view-record <plugin> --form-id <formid> --json
 esp create-override <source> -o <output> --editor-id <id> --type <type> --json
 esp update-spell <source> --output esp-workspace/output/<new-patch.esp> --editor-id <id> --type spell --equipment-type <FORMID:MODNAME> --json
+esp update-spell <source> --output esp-workspace/output/<new-patch.esp> --editor-id <id> --magic-skill Alteration --json
 esp find-record --search <pattern> --type <type> --plugin <plugin> --json
 esp batch-override <source> -o <output> --search <pattern> --type <type> --json
 esp compare-record <plugin1> <plugin2> --editor-id <id> --type <type> --json

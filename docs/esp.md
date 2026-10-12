@@ -1104,14 +1104,17 @@ esp view-record "MyMod.esp" --editor-id "MyQuest" --type quest --json
 Create an ESL override patch that changes selected fields on an existing spell. The source plugin is read-only; output must be a new `.esp` or `.esl` path, and an existing output file is never overwritten. Unspecified fields, effects, and scripts are preserved.
 
 ```bash
-esp update-spell <source> --output <new-patch.esp> --editor-id <editorId> [--type spell|power|lesser-power|ability] [--equipment-type <FORMID:MODNAME>]
+esp update-spell <source> --output <new-patch.esp> --editor-id <editorId> [--type spell|power|lesser-power|ability] [--equipment-type <FORMID:MODNAME>] [--magic-skill <school>]
 ```
 
-At least one of `--type` or `--equipment-type` is required. Equipment type uses a FormKey such as `013F44:Skyrim.esm`.
+At least one of `--type`, `--equipment-type`, or `--magic-skill` is required. Equipment type uses a FormKey such as `013F44:Skyrim.esm`. `--magic-skill` sets the school on each distinct Magic Effect record used by the spell and includes those overrides in the same patch. Each effect must be defined in the source plugin; changing a shared effect also changes it anywhere else it is used. Supported values are `None`, `Alteration`, `Conjuration`, `Destruction`, `Illusion`, and `Restoration`.
 
 ```bash
 # Convert a VRIK-style calibration power into a normal hand-equipped spell
 esp update-spell "VRIK.esp" --output "esp-workspace/output/VRIKSpellPatch.esp" --editor-id "_vrik_spel_calibrate" --type spell --equipment-type "013F44:Skyrim.esm"
+
+# Also set the associated Magic Effect school and include its override
+esp update-spell "VRIK.esp" --output "esp-workspace/output/VRIKSpellPatch.esp" --editor-id "_vrik_spel_calibrate" --type spell --equipment-type "013F44:Skyrim.esm" --magic-skill Alteration
 ```
 
 The patch includes the source plugin and its listed masters and must load after them.

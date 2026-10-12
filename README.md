@@ -29,6 +29,19 @@ Create new mods, inspect existing ones, edit archives, decompile scripts, view r
 
 ---
 
+## Changes in This Fork
+
+This fork builds on [Spooky's upstream toolkit](https://github.com/SpookyPirate/spookys-automod-toolkit) and adds locally maintained features. The additions currently include:
+
+- **Fallout 4 plugin commands** (`fo4`) for inspecting plugins, creating records, and writing single-record override patches. See [Fallout 4 commands and limitations](docs/fallout4.md).
+- **Fallout 4 F4SE project commands** (`f4se`) for generating and building native plugin starters for Fallout 4 VR 1.2.72 and legacy desktop 1.10.163. See [F4SE setup and validation limits](docs/f4se.md).
+- **Skyrim ESP/ESL workflow additions**, including staged ESL flagging and compaction, broader record handling, batch script removal, and additional record builders and editing commands. See the [ESP command reference](docs/esp.md) and [changelog](CHANGELOG.md).
+- **MCM and assistant workflow updates**, including expanded setup guidance and Claude Code skills for the added commands. See [MCM documentation](docs/mcm.md) and the [Claude Code skills](.claude/skills/).
+
+Upstream features and attribution are retained. This section describes additions maintained in this fork; it does not claim that these changes have been merged into upstream.
+
+---
+
 ## Requirements
 
 - **Windows**

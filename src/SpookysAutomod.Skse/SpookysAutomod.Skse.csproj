@@ -10,6 +10,9 @@
 
   <!-- Embed template files -->
   <ItemGroup>
+    <EmbeddedResource Include="..\..\templates\f4se\*" LogicalName="F4se.%(Filename)%(Extension)" />
+  </ItemGroup>
+  <ItemGroup>
     <EmbeddedResource Include="..\..\templates\skse\**\*" LinkBase="Templates" />
   </ItemGroup>
 

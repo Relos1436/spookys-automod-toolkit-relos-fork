@@ -22,6 +22,14 @@ public class ArmorBuilder
         _armor.ArmorRating = 10;
         _armor.Value = 100;
         _armor.Weight = 5;
+        // See WeaponBuilder's constructor for why: without this, ObjectBounds defaults to a
+        // fully degenerate (0,0,0)-(0,0,0) box, confirmed via a real crash log to crash the
+        // inventory item-card 3D preview code for a weapon record - the same risk applies here.
+        _armor.ObjectBounds = new ObjectBounds
+        {
+            First = new P3Int16(-5, -5, -5),
+            Second = new P3Int16(5, 5, 5)
+        };
     }
 
     public ArmorBuilder WithName(string name)

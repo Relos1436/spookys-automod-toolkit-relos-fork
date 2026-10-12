@@ -70,6 +70,11 @@ Enables consistent error handling and JSON serialization for AI parsing.
 - Modified using **Mutagen** library (strongly-typed C# API)
 - FormIDs uniquely identify records: `0x000800` (ESL range: `0x800-0xFFF`)
 
+**ESL Flagging and Compaction:**
+
+- esp flag-light sets the ESL header flag only and refuses plugin-owned local FormIDs above 0xFFF.
+- esp compact-light stages a copy, remaps plugin-owned records into 0x000-0xFFF, remaps internal links, sets the ESL flag, and verifies the reopened output. FormID changes may affect saves and dependent files; review its mapping before deployment.
+
 **Papyrus Scripts (.psc → .pex):**
 
 - Game's scripting language for quest logic, AI behavior
@@ -115,6 +120,9 @@ dotnet build
 
 # Run CLI
 dotnet run --project src/SpookysAutomod.Cli -- <module> <command> [args] --json
+
+# Create a separate override patch while updating spell fields
+dotnet run --project src/SpookysAutomod.Cli -- esp update-spell <source> --output esp-workspace/output/<new-patch.esp> --editor-id <id> --type spell --equipment-type <FORMID:MODNAME>
 
 # Run tests
 dotnet test

@@ -8,6 +8,104 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- esp flag-light sets the ESL header flag without rewriting records and refuses plugins whose owned local FormIDs exceed 0xFFF.
+- esp compact-light stages an ESL conversion by remapping plugin-owned FormIDs and internal links into 0x000-0xFFF, then reopens and verifies the output. It preserves the source and reports the old-to-new map and save/dependency compatibility warning.
+
+### Added
+
+- **`esp update-spell`** creates a separate ESL override patch for changing an existing spell's type and/or equipment type while preserving its other fields. It keeps the source plugin read-only, carries over its master chain, and refuses to overwrite an existing output file.
+
+- **`esp view-record` now supports `ConstructibleObject`** (`--type constructibleobject`, aliases
+  `cobj`/`recipe`) - previously `add-recipe` could create crafting recipes but nothing could
+  inspect one afterward (`Unsupported record type` for every alias tried). Shows `CreatedObject`/
+  `CreatedObjectCount`, `WorkbenchKeyword`, and the full `Items` ingredient list (each with its
+  own FormKey + count).
+
+- **`esp clear-armor-enchantment <plugin> <editorId>`** - removes an Armor record's attached
+  `ObjectEffect` (enchantment) entirely: clears the armor's `EITM` link and deletes the
+  `ObjectEffect` and every `MagicEffect` it references. Needed when `import-armor` deep-copies
+  an item whose source enchantment is unwanted in the target mod (e.g. a "carry capacity"
+  buff made redundant by the target mod's own custom weight system) - previously there was no
+  way to detach an enchantment without leaving orphaned `ENCH`/`MGEF` records behind, since
+  `remove-record` didn't reach those collections either (see below).
+
+- **`esp set-armor-name <plugin> <editorId> --name <name>`** - sets an Armor record's display
+  name (`FULL`). Filled a real gap: `import-armor` copies the source item's display name
+  as-is, and there was previously no command to rename it afterward short of a full record
+  edit.
+
+### Fixed
+
+- **`esp remove-record` now reaches `ObjectEffect`, `MagicEffect`, `Keyword`, `ArmorAddon`,
+  `Container`, and `ConstructibleObject` records.** Previously it only searched 16 record
+  groups (Weapons, Armors, Spells, Quests, NPCs, Perks, Factions, Books, MiscItems, Globals,
+  LeveledItems, FormLists, Outfits, Locations, EncounterZones, Packages) and silently reported
+  "Record not found" for anything else - discovered when trying to delete an orphaned
+  enchantment/magic-effect pair left over after `clear-armor-enchantment` unlinked them from
+  their armor.
+
+### Added
+
+- **`esp add-weapon` now sets all equip-safety auxiliary fields by default, not just
+  `ObjectBounds`.** The `ObjectBounds` fix below wasn't actually the crash - it took a direct
+  field-by-field diff against a real, working released mod's weapon record to find the true
+  cause: `AddNew()` also leaves `EquipmentType`, `BlockBashImpact`, `AlternateBlockMaterial`,
+  `ImpactDataSet`, `AttackFailSound`, `EquipSound`, `UnequipSound`, `DetectionSoundLevel`, and
+  **`FirstPersonModel`** completely null/unset - none of which a Creation-Kit-authored weapon is
+  ever missing. A weapon with a null `FirstPersonModel` crashed the game the moment it was
+  equipped and viewed in inventory, confirmed via a real crash log, twice, after two other
+  fixes (Description, then ObjectBounds alone) turned out to be real gaps but not the cause.
+
+  Now: `WeaponBuilder`'s constructor sets the eight reference/sound/keyword-adjacent fields to
+  verified values from a real one-handed dagger-type weapon (all vanilla `Skyrim.esm` forms - no
+  new master required; a reasonable universal baseline, not necessarily precise per weapon
+  type). `WithModel()` (and therefore every `With*Model()` preset) now also auto-creates a
+  matching `FirstPersonModel` Static wrapping the same mesh - override with the new
+  `WithFirstPersonModel()` if a different mesh or an existing Static is wanted instead.
+
+- **`esp add-weapon`/`add-armor` now set a non-zero `ObjectBounds` by default.** Previously
+  neither builder set bounds at all, leaving a fully degenerate `(0,0,0)-(0,0,0)` box — unlike
+  any Creation-Kit-authored record, which always has real bounds computed from its mesh.
+  Confirmed via a real crash log this specifically crashes the inventory item-card 3D preview
+  code. `WeaponBuilder` gained `WithBounds(minX, minY, minZ, maxX, maxY, maxZ)` to override the
+  default with real dimensions when known; the default itself just needs to be non-zero, not
+  precisely accurate to the mesh.
+
+- **`esp add-weapon` gained `--description`.** Confirmed via a real crash log that at least one
+  popular UI mod (DescriptionFramework) crashes to desktop building the item card for a weapon
+  with no description text — traced to `ItemCardFixer::applyDescription` reading through a null
+  pointer for the empty description. `add-weapon`'s docs now call this out explicitly; the
+  builder already had `WithDescription`, only the CLI flag was missing.
+
+- **`esp add-weapon` gained `--speed`, `--reach`, `--critical-damage`, and `--keyword`.** The
+  builder (`WeaponBuilder.WithSpeed`/`WithReach`) already supported speed and reach, but the CLI
+  never exposed them; `WithCriticalDamage`/`WithKeyword` are new on the builder too. Surfaced by
+  needing to recreate a real vanilla weapon's exact feel (a released mod's tool item) via CLI and
+  discovering there was no way to set anything past damage/value/weight — those four fields had
+  to be patched in afterward with a one-off Mutagen script instead. `--keyword` accepts a
+  repeatable `FormId:ModName.esp` (no `0x` prefix) or an EditorID already in the target plugin,
+  same parsing `add-form-list`'s `--add-form` already uses.
+
+  **Doc fix while touching this:** `add-form-list`'s own `--add-form` description and example
+  had the FormKey order backwards (`ModName.esp:0xFormId`) — `FormKey.TryFactory` actually
+  requires `FormId:ModName.esp` with no `0x` prefix (confirmed by testing all four
+  order/prefix combinations directly). Both commands' descriptions and examples now show the
+  real accepted format.
+
+- **`esp add-keyword <plugin> <editorId>`** — creates Keyword (KYWD) records. There was previously no way to create a keyword at all. The main use case is defining tags for a runtime patcher such as SkyPatcher to attach onto records your plugin doesn't own, letting you classify third-party items without editing or overriding them. Refuses duplicate EditorIDs, since a patcher matching by EditorID would otherwise bind to an arbitrary one of the duplicates.
+
+  Implementation notes for anyone extending this: unlike most Mutagen groups, `SkyrimGroup<Keyword>` exposes **no `AddNew()`** — construct `new Keyword(mod)` (which assigns the FormKey) and `Add()` it to the group. `Keyword.Color` is a `System.Drawing.Color?`, not a uint.
+
+### Fixed
+
+- **`--type` filtering silently ignored the filter for most record types.** `FilterByRecordType` only knew 16 types and fell through to `EnumerateMajorRecords()` for anything else — so an unrecognised type returned *every record in the plugin* while still printing `Filter: <type>` as though it had worked. Against Skyrim.esm, `--type MGEF` reported 869,687 "matches"; it should have been 950. Typos behaved the same way, silently.
+
+  Now: ~50 record types are supported (magic effects, ingestibles, keywords, containers, cells, enchantments, recipes, scrolls, races, packages and more), record-signature spellings are accepted alongside long names (`MGEF`/`magiceffect`, `ALCH`/`ingestible`, `KYWD`/`keyword`), matching stays case-insensitive, and an **unknown type is now an error listing the valid ones** rather than a silent full-plugin dump. Affects `list-records`, `find-record` and `batch-override`.
+
+  A filter that silently ignores the filter is worse than one that refuses — this was actively misleading rather than merely incomplete.
+
 ## [1.11.2] - 2026-05-20
 
 ### Fixed

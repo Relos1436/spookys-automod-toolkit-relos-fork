@@ -843,6 +843,8 @@ If missing: Guide to README "SKSE C++ Build Tools" section
 ```bash
 esp create <name> --light --author <name> --json
 esp info <plugin> --json                    # Plugin analysis and info
+esp flag-light <plugin> --output <staged-same-name> --json    # Header-only when owned IDs fit 0xFFF
+esp compact-light <plugin> --output <staged-same-name> --json # Remap owned IDs and links, then flag; review map
 
 esp add-weapon <plugin> <id> --name <n> --damage <d> --model <preset> --json
 esp add-armor <plugin> <id> --name <n> --rating <r> --model <preset> --json
@@ -878,6 +880,7 @@ esp debug-types <pattern> --json
 esp view-record <plugin> --editor-id <id> --type <type> --json
 esp view-record <plugin> --form-id <formid> --json
 esp create-override <source> -o <output> --editor-id <id> --type <type> --json
+esp update-spell <source> --output esp-workspace/output/<new-patch.esp> --editor-id <id> --type spell --equipment-type <FORMID:MODNAME> --json
 esp find-record --search <pattern> --type <type> --plugin <plugin> --json
 esp batch-override <source> -o <output> --search <pattern> --type <type> --json
 esp compare-record <plugin1> <plugin2> --editor-id <id> --type <type> --json

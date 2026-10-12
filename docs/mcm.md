@@ -189,7 +189,7 @@ Generated config.json structure:
   "minMcmVersion": 7,
   "pages": [
     {
-      "pageDisplayName": "Main",
+      "pageDisplayName": "General",
       "content": [
         {
           "type": "toggle",
@@ -209,6 +209,14 @@ Generated config.json structure:
   ]
 }
 ```
+
+### Known Gotcha: never name a page `"Main"`
+
+Confirmed 2026-09-09 on MCM Helper v1.6.1.0 (Skyrim VR) with TrueWieldVR's config: a page whose `pageDisplayName` is literally `"Main"` renders completely blank in-game — no controls show, even with a valid `header` as the first content item and no errors in `MCMHelper.log`. Every other page in the same file (different names) rendered fine.
+
+Fix: rename the page to anything else (`"General"` is the common convention — see PhysicalCollisionVR, Holstered Potions VR, and other working configs in this project's mod list). No other change was needed; the page's contents were already correct.
+
+When generating or auditing an MCM config (via this toolkit's `mcm create`/`add-toggle`/etc. or by hand), avoid `"Main"` as a `pageDisplayName` — use `"General"` instead.
 
 ### Control Types
 

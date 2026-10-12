@@ -25,6 +25,46 @@ public class WeaponBuilder
             Weight = 5,
             Value = 100
         };
+        // A Creation-Kit-authored weapon always has real bounds computed from its mesh. Without
+        // this, ObjectBounds defaults to a fully degenerate (0,0,0)-(0,0,0) box, which has been
+        // confirmed (via a real crash log) to crash the game's inventory item-card 3D preview
+        // code for at least one record. WithBounds() can override this with real dimensions;
+        // this default just needs to be non-zero, not precisely accurate.
+        _weapon.ObjectBounds = new ObjectBounds
+        {
+            First = new P3Int16(-5, -5, -5),
+            Second = new P3Int16(5, 5, 5)
+        };
+
+        // A weapon built here (via AddNew(), never touched by the Creation Kit) leaves several
+        // auxiliary reference fields completely null: EquipmentType, BlockBashImpact,
+        // AlternateBlockMaterial, ImpactDataSet, the three sounds below, and DetectionSoundLevel.
+        // A real CK-authored weapon always has these populated (CK fills them in from the chosen
+        // weapon type/material preset). Confirmed via a real crash log + a direct field-by-field
+        // diff against a working released mod's one-handed dagger-type weapon that a weapon with
+        // several of these null can crash the game's inventory item-card code. These values are
+        // copied from that verified-working one-handed dagger reference (all real Skyrim.esm
+        // forms - no new master required) and applied as a universal baseline default: better to
+        // have "close enough for a one-handed weapon" values than null for every other weapon
+        // type too, pending someone verifying accurate per-type vanilla equivalents.
+        _weapon.EquipmentType.SetTo(new FormKey(ModKey.FromFileName("Skyrim.esm"), 0x13F42));
+        _weapon.BlockBashImpact.SetTo(new FormKey(ModKey.FromFileName("Skyrim.esm"), 0x183FF));
+        _weapon.AlternateBlockMaterial.SetTo(new FormKey(ModKey.FromFileName("Skyrim.esm"), 0x774C2));
+        _weapon.ImpactDataSet.SetTo(new FormKey(ModKey.FromFileName("Skyrim.esm"), 0x13CAC));
+        _weapon.AttackFailSound.SetTo(new FormKey(ModKey.FromFileName("Skyrim.esm"), 0x3C730));
+        _weapon.EquipSound.SetTo(new FormKey(ModKey.FromFileName("Skyrim.esm"), 0x3CED9));
+        _weapon.UnequipSound.SetTo(new FormKey(ModKey.FromFileName("Skyrim.esm"), 0x3CEDB));
+        _weapon.DetectionSoundLevel = SoundLevel.Silent;
+    }
+
+    public WeaponBuilder WithBounds(short minX, short minY, short minZ, short maxX, short maxY, short maxZ)
+    {
+        _weapon.ObjectBounds = new ObjectBounds
+        {
+            First = new P3Int16(minX, minY, minZ),
+            Second = new P3Int16(maxX, maxY, maxZ)
+        };
+        return this;
     }
 
     public WeaponBuilder WithName(string name)
@@ -71,6 +111,20 @@ public class WeaponBuilder
     {
         _weapon.Data ??= new WeaponData();
         _weapon.Data.Reach = reach;
+        return this;
+    }
+
+    public WeaponBuilder WithCriticalDamage(ushort criticalDamage)
+    {
+        _weapon.Critical ??= new CriticalData();
+        _weapon.Critical.Damage = criticalDamage;
+        return this;
+    }
+
+    public WeaponBuilder WithKeyword(FormKey keywordFormKey)
+    {
+        _weapon.Keywords ??= new ExtendedList<IFormLinkGetter<IKeywordGetter>>();
+        _weapon.Keywords.Add(keywordFormKey.ToLink<IKeywordGetter>());
         return this;
     }
 
@@ -148,9 +202,42 @@ public class WeaponBuilder
     /// Sets the weapon's 3D model path.
     /// Use paths relative to Data/Meshes/, e.g., "Weapons\Iron\IronSword.nif"
     /// </summary>
+    /// <remarks>
+    /// Also auto-creates a matching FirstPersonModel Static wrapping the same nif, since a
+    /// completely null FirstPersonModel (never set by AddNew()) has been confirmed via a real
+    /// crash log to crash the game when the weapon is equipped/viewed in the inventory. Call
+    /// WithFirstPersonModel() afterward to point at a different mesh (or an existing Static)
+    /// instead of this auto-created one.
+    /// </remarks>
     public WeaponBuilder WithModel(string modelPath)
     {
         _weapon.Model = new Model { File = modelPath };
+
+        var firstPersonStatic = _mod.Statics.AddNew();
+        firstPersonStatic.EditorID = $"{_weapon.EditorID}_1stPerson";
+        firstPersonStatic.Model = new Model { File = modelPath };
+        _weapon.FirstPersonModel.SetTo(firstPersonStatic.FormKey);
+
+        return this;
+    }
+
+    /// <summary>
+    /// Overrides the weapon's first-person model - either a different mesh (creates a new
+    /// Static wrapping it) or an existing Static record's FormKey (e.g. a vanilla one, to avoid
+    /// creating a duplicate). Only needed if the auto-created one from WithModel() isn't right.
+    /// </summary>
+    public WeaponBuilder WithFirstPersonModel(string modelPath)
+    {
+        var firstPersonStatic = _mod.Statics.AddNew();
+        firstPersonStatic.EditorID = $"{_weapon.EditorID}_1stPerson";
+        firstPersonStatic.Model = new Model { File = modelPath };
+        _weapon.FirstPersonModel.SetTo(firstPersonStatic.FormKey);
+        return this;
+    }
+
+    public WeaponBuilder WithFirstPersonModel(FormKey existingStaticFormKey)
+    {
+        _weapon.FirstPersonModel.SetTo(existingStaticFormKey);
         return this;
     }
 

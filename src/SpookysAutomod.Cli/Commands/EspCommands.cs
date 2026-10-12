@@ -1,10 +1,12 @@
 using System.CommandLine;
+using System.Buffers.Binary;
 using System.Text.Json;
 using SpookysAutomod.Core.Logging;
 using SpookysAutomod.Core.Models;
 using SpookysAutomod.Esp.Builders;
 using SpookysAutomod.Esp.Services;
 using Mutagen.Bethesda.Plugins;
+using Mutagen.Bethesda.Plugins.Records;
 using Mutagen.Bethesda.Skyrim;
 
 namespace SpookysAutomod.Cli.Commands;
@@ -23,8 +25,11 @@ public static class EspCommands
 
         espCommand.AddCommand(CreateCreateCommand());
         espCommand.AddCommand(CreateInfoCommand());
+        espCommand.AddCommand(CreateFlagLightCommand());
+        espCommand.AddCommand(EspLightCommands.CreateCompactLightCommand(jsonOption));
         espCommand.AddCommand(CreateAddQuestCommand());
         espCommand.AddCommand(CreateAddSpellCommand());
+        espCommand.AddCommand(CreateUpdateSpellCommand());
         espCommand.AddCommand(CreateAddGlobalCommand());
         espCommand.AddCommand(CreateAddWeaponCommand());
         espCommand.AddCommand(CreateAddArmorCommand());
@@ -43,6 +48,8 @@ public static class EspCommands
         espCommand.AddCommand(CreateAutoFillCommand());
         espCommand.AddCommand(CreateAutoFillAllCommand());
         espCommand.AddCommand(CreateAddLeveledItemCommand());
+        espCommand.AddCommand(CreateSetArmorAddonModelCommand());
+        espCommand.AddCommand(CreateAddKeywordCommand());
         espCommand.AddCommand(CreateAddFormListCommand());
         espCommand.AddCommand(CreateAddEncounterZoneCommand());
         espCommand.AddCommand(CreateAddLocationCommand());
@@ -52,6 +59,7 @@ public static class EspCommands
         espCommand.AddCommand(CreateFindRecordCommand());
         espCommand.AddCommand(CreateListRecordsCommand());
         espCommand.AddCommand(CreateBatchOverrideCommand());
+        espCommand.AddCommand(CreateBatchRenameCommand());
         espCommand.AddCommand(CreateCompareRecordCommand());
         espCommand.AddCommand(CreateConflictsCommand());
         espCommand.AddCommand(CreateListConditionsCommand());
@@ -61,6 +69,21 @@ public static class EspCommands
         espCommand.AddCommand(CreateAttachPackageCommand());
         espCommand.AddCommand(CreateRemoveRecordCommand());
         espCommand.AddCommand(CreateCloneRecordCommand());
+        espCommand.AddCommand(CreateAddPlacedObjectCommand());
+        espCommand.AddCommand(CreateOverridePlacedObjectCommand());
+        espCommand.AddCommand(CreateRemovePlacedObjectCommand());
+        espCommand.AddCommand(CreateAddRecipeCommand());
+        espCommand.AddCommand(CreateRemoveKeywordCommand());
+        espCommand.AddCommand(CreateClearArmorEnchantmentCommand());
+        espCommand.AddCommand(CreateSetArmorNameCommand());
+        espCommand.AddCommand(CreateImportArmorCommand());
+        espCommand.AddCommand(CreateRemoveMasterCommand());
+        espCommand.AddCommand(CreateAddContainerCommand());
+        espCommand.AddCommand(CreateCreateCellCommand());
+        espCommand.AddCommand(CreateAddPlacedObjectLocalCommand());
+        espCommand.AddCommand(CreateClearContainerItemsLocalCommand());
+        espCommand.AddCommand(CreateAddContainerItemLocalCommand());
+        espCommand.AddCommand(CreateRemoveScriptCommand());
 
         return espCommand;
     }
@@ -167,6 +190,113 @@ public static class EspCommands
         return cmd;
     }
 
+    private static Command CreateFlagLightCommand()
+    {
+        var pluginArg = new Argument<string>("plugin", "Path to the existing ESP plugin");
+        var outputOption = new Option<string>(
+            aliases: new[] { "--output", "-o" },
+            description: "Output path for the flagged plugin (must keep the source filename)")
+        {
+            IsRequired = true
+        };
+
+        var cmd = new Command("flag-light", "Set the ESL flag on an existing ESP without rewriting its records")
+        {
+            pluginArg,
+            outputOption
+        };
+
+        cmd.SetHandler((pluginPath, outputPath, json) =>
+        {
+            try
+            {
+                var sourcePath = Path.GetFullPath(pluginPath);
+                var destinationPath = Path.GetFullPath(outputPath);
+                if (!string.Equals(Path.GetExtension(sourcePath), ".esp", StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException("The source must be an .esp plugin.");
+                if (!string.Equals(Path.GetExtension(destinationPath), ".esp", StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException("The output must use the .esp extension.");
+                if (!string.Equals(Path.GetFileName(sourcePath), Path.GetFileName(destinationPath), StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException("The output must keep the source filename so the plugin identity stays unchanged.");
+                if (string.Equals(sourcePath, destinationPath, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException("Source and output paths must differ; the source is never overwritten.");
+                if (!File.Exists(sourcePath))
+                    throw new FileNotFoundException("Source plugin was not found.", sourcePath);
+                if (File.Exists(destinationPath))
+                    throw new IOException("Output already exists; choose a new staging path.");
+
+                var sourceMod = SkyrimMod.CreateFromBinary(sourcePath, SkyrimRelease.SkyrimSE);
+                var sourceRecords = sourceMod.EnumerateMajorRecords().ToArray();
+                var localRecords = sourceRecords.Where(r => r.FormKey.ModKey == sourceMod.ModKey).ToArray();
+                var outOfRange = localRecords.Where(r => r.FormKey.ID > 0xFFF).Select(r => r.FormKey.ToString()).ToArray();
+                if (outOfRange.Length > 0)
+                    throw new InvalidOperationException($"Plugin-owned FormIDs exceed the ESL range 0x000-0xFFF: {string.Join(", ", outOfRange)}. Use esp compact-light to stage a remapped ESL plugin; changed FormIDs can affect saves and dependent patches.");
+
+                var sourceBytes = File.ReadAllBytes(sourcePath);
+                if (sourceBytes.Length < 12 || !sourceBytes.AsSpan(0, 4).SequenceEqual("TES4"u8))
+                    throw new InvalidDataException("The plugin does not begin with a valid TES4 record header.");
+
+                const int recordFlagsOffset = 8;
+                const uint smallFlag = 0x00000200;
+                var originalFlags = BinaryPrimitives.ReadUInt32LittleEndian(sourceBytes.AsSpan(recordFlagsOffset, 4));
+                var updatedFlags = originalFlags | smallFlag;
+                var outputData = sourceBytes.ToArray();
+                BinaryPrimitives.WriteUInt32LittleEndian(outputData.AsSpan(recordFlagsOffset, 4), updatedFlags);
+
+                Directory.CreateDirectory(Path.GetDirectoryName(destinationPath)!);
+                File.WriteAllBytes(destinationPath, outputData);
+                var writtenBytes = File.ReadAllBytes(destinationPath);
+                var changedOffsets = Enumerable.Range(0, sourceBytes.Length)
+                    .Where(i => sourceBytes[i] != writtenBytes[i])
+                    .ToArray();
+                if (writtenBytes.Length != sourceBytes.Length || changedOffsets.Any(i => i < recordFlagsOffset || i >= recordFlagsOffset + 4))
+                    throw new InvalidDataException("Output verification failed: bytes outside the TES4 record flags changed.");
+                if (BinaryPrimitives.ReadUInt32LittleEndian(writtenBytes.AsSpan(recordFlagsOffset, 4)) != updatedFlags)
+                    throw new InvalidDataException("Output verification failed: TES4 header flags do not match the requested value.");
+
+                var outputMod = SkyrimMod.CreateFromBinary(destinationPath, SkyrimRelease.SkyrimSE);
+                var outputRecords = outputMod.EnumerateMajorRecords().ToArray();
+                var outputLocalRecords = outputRecords.Where(r => r.FormKey.ModKey == outputMod.ModKey).ToArray();
+                var sourceKeys = sourceRecords.Select(r => r.FormKey.ToString()).OrderBy(k => k, StringComparer.Ordinal).ToArray();
+                var outputKeys = outputRecords.Select(r => r.FormKey.ToString()).OrderBy(k => k, StringComparer.Ordinal).ToArray();
+                var sourceMasters = sourceMod.ModHeader.MasterReferences.Select(m => m.Master.FileName.ToString()).OrderBy(k => k, StringComparer.Ordinal).ToArray();
+                var outputMasters = outputMod.ModHeader.MasterReferences.Select(m => m.Master.FileName.ToString()).OrderBy(k => k, StringComparer.Ordinal).ToArray();
+                if ((outputMod.ModHeader.Flags & SkyrimModHeader.HeaderFlag.Small) == 0 ||
+                    !sourceKeys.SequenceEqual(outputKeys) ||
+                    !sourceMasters.SequenceEqual(outputMasters) ||
+                    sourceRecords.Length != outputRecords.Length ||
+                    outputLocalRecords.Any(r => r.FormKey.ID > 0xFFF))
+                    throw new InvalidDataException("Output verification failed: ESL flag, master list, or record identities changed unexpectedly.");
+
+                var result = new
+                {
+                    success = true,
+                    source = sourcePath,
+                    output = destinationPath,
+                    isLight = true,
+                    masterFiles = outputMasters,
+                    totalMajorRecords = outputRecords.Length,
+                    localRecords = outputLocalRecords.Length,
+                    localFormIdMax = outputLocalRecords.Length == 0 ? (uint?)null : outputLocalRecords.Max(r => r.FormKey.ID),
+                    changedByteOffsets = changedOffsets
+                };
+                if (json)
+                    Console.WriteLine(JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true }));
+                else
+                    Console.WriteLine($"Flagged {Path.GetFileName(destinationPath)} as ESL. {outputLocalRecords.Length} local records; masters preserved; changed bytes: {string.Join(", ", changedOffsets)}.");
+            }
+            catch (Exception ex)
+            {
+                if (json)
+                    Console.WriteLine(JsonSerializer.Serialize(new { success = false, error = ex.Message }, new JsonSerializerOptions { WriteIndented = true }));
+                else
+                    Console.Error.WriteLine($"Error: {ex.Message}");
+                Environment.ExitCode = 1;
+            }
+        }, pluginArg, outputOption, _jsonOption);
+
+        return cmd;
+    }
     private static Command CreateAddQuestCommand()
     {
         var pluginArg = new Argument<string>("plugin", "Path to the plugin file");
@@ -423,6 +553,84 @@ public static class EspCommands
         return cmd;
     }
 
+    private static Command CreateUpdateSpellCommand()
+    {
+        var sourceArg = new Argument<string>("source", "Path to the source plugin containing the spell");
+        var outputOption = new Option<string>(new[] { "--output", "-o" }, "Output path for the new override plugin (relative to the current directory if not rooted)")
+        {
+            IsRequired = true
+        };
+        var editorIdOption = new Option<string>("--editor-id", "EditorID of the spell to update")
+        {
+            IsRequired = true
+        };
+        var typeOption = new Option<string?>("--type", "New type: spell, power, lesser-power, or ability");
+        var equipmentTypeOption = new Option<string?>("--equipment-type", "Equipment type FormKey (FORMID:MODNAME)");
+
+        var cmd = new Command("update-spell", "Create an override patch changing fields on an existing spell")
+        {
+            sourceArg,
+            outputOption,
+            editorIdOption,
+            typeOption,
+            equipmentTypeOption
+        };
+
+        cmd.SetHandler(context =>
+        {
+            var source = context.ParseResult.GetValueForArgument(sourceArg);
+            var output = context.ParseResult.GetValueForOption(outputOption)!;
+            var editorId = context.ParseResult.GetValueForOption(editorIdOption)!;
+            var typeText = context.ParseResult.GetValueForOption(typeOption);
+            var equipmentTypeText = context.ParseResult.GetValueForOption(equipmentTypeOption);
+            var json = context.ParseResult.GetValueForOption(_jsonOption);
+            var verbose = context.ParseResult.GetValueForOption(_verboseOption);
+
+            if (string.IsNullOrWhiteSpace(typeText) && string.IsNullOrWhiteSpace(equipmentTypeText))
+            {
+                OutputError("Specify at least one of --type or --equipment-type.", json);
+                return;
+            }
+
+            SpellType? spellType = null;
+            if (!string.IsNullOrWhiteSpace(typeText))
+            {
+                spellType = typeText.Trim().ToLowerInvariant() switch
+                {
+                    "spell" => SpellType.Spell,
+                    "power" => SpellType.Power,
+                    "lesser-power" => SpellType.LesserPower,
+                    "ability" => SpellType.Ability,
+                    _ => null
+                };
+                if (!spellType.HasValue)
+                {
+                    OutputError($"Unknown spell type '{typeText}'. Use spell, power, lesser-power, or ability.", json);
+                    return;
+                }
+            }
+
+            var logger = CreateLogger(json, verbose);
+            var service = new PluginService(logger);
+            var result = service.UpdateSpell(source, output, editorId, spellType, equipmentTypeText);
+
+            if (json)
+            {
+                Console.WriteLine(result.ToJson(true));
+            }
+            else if (result.Success)
+            {
+                Console.WriteLine($"Created ESL spell override patch: {result.Value}");
+            }
+            else
+            {
+                OutputError(result.Error ?? "Failed to update spell.", json, result.Suggestions);
+            }
+        });
+
+        return cmd;
+    }
+
     private static Command CreateAddGlobalCommand()
     {
         var pluginArg = new Argument<string>("plugin", "Path to the plugin file");
@@ -629,6 +837,387 @@ public static class EspCommands
         return cmd;
     }
 
+    private static Command CreateAddContainerCommand()
+    {
+        var pluginArg = new Argument<string>("plugin", "Path to the plugin file");
+        var editorIdArg = new Argument<string>("editorId", "Editor ID for the container");
+        var nameOption = new Option<string?>("--name", "Display name of the container");
+        var weightOption = new Option<float?>("--weight", "Carry weight limit (omit for unlimited)");
+        var itemOption = new Option<string?>("--item", "Seed the container with starting stock: a FormKey as 'FORMID:PluginName.esp'");
+        var countOption = new Option<int>("--count", () => 1, "Count for --item (default 1)");
+        var dryRunOption = new Option<bool>("--dry-run", "Preview changes without saving");
+
+        var cmd = new Command("add-container", "Add a container record (CONT) to a plugin")
+        {
+            pluginArg, editorIdArg, nameOption, weightOption, itemOption, countOption, dryRunOption
+        };
+
+        cmd.SetHandler((context) =>
+        {
+            var plugin = context.ParseResult.GetValueForArgument(pluginArg);
+            var editorId = context.ParseResult.GetValueForArgument(editorIdArg);
+            var name = context.ParseResult.GetValueForOption(nameOption);
+            var weight = context.ParseResult.GetValueForOption(weightOption);
+            var item = context.ParseResult.GetValueForOption(itemOption);
+            var count = context.ParseResult.GetValueForOption(countOption);
+            var dryRun = context.ParseResult.GetValueForOption(dryRunOption);
+            var json = context.ParseResult.GetValueForOption(_jsonOption);
+            var verbose = context.ParseResult.GetValueForOption(_verboseOption);
+
+            var logger = CreateLogger(json, verbose);
+            var service = new PluginService(logger);
+
+            var loadResult = service.LoadPluginForEdit(plugin);
+            if (!loadResult.Success) { OutputError(loadResult.Error!, json); return; }
+
+            var mod = loadResult.Value!;
+            var builder = new ContainerBuilder(mod, editorId);
+            if (!string.IsNullOrEmpty(name)) builder.WithName(name);
+            if (weight.HasValue) builder.WithWeight(weight.Value);
+            if (!string.IsNullOrEmpty(item))
+            {
+                if (!Mutagen.Bethesda.Plugins.FormKey.TryFactory(item, out var itemKey))
+                {
+                    OutputError($"Invalid --item FormKey format: {item}", json,
+                        suggestions: new[] { "Use format: 000800:PluginName.esp" });
+                    return;
+                }
+                builder.WithItem(itemKey, count);
+            }
+
+            var container = builder.Build();
+
+            Result saveResult = dryRun
+                ? Result.Ok($"{plugin} (DRY RUN - not saved)")
+                : service.SavePlugin(mod, plugin);
+
+            if (json)
+            {
+                if (saveResult.Success)
+                {
+                    Console.WriteLine(new
+                    {
+                        success = true,
+                        result = new { editorId = container.EditorID, formId = container.FormKey.ToString(), dryRun }
+                    }.ToJson());
+                }
+                else
+                {
+                    Console.WriteLine(new { success = false, error = saveResult.Error }.ToJson());
+                    Environment.ExitCode = 1;
+                }
+            }
+            else if (saveResult.Success)
+            {
+                var msg = $"Added container: {container.EditorID} ({container.FormKey})";
+                if (dryRun) msg += " [DRY RUN - not saved]";
+                Console.WriteLine(msg);
+            }
+            else
+            {
+                Console.Error.WriteLine($"Error: {saveResult.Error}");
+                Environment.ExitCode = 1;
+            }
+        });
+
+        return cmd;
+    }
+
+    private static Command CreateCreateCellCommand()
+    {
+        var pluginArg = new Argument<string>("plugin", "Path to the plugin file");
+        var editorIdArg = new Argument<string>("editorId", "Editor ID for the new interior cell");
+        var nameOption = new Option<string?>("--name", "Display name of the cell (omit for an unnamed/hidden utility cell)");
+        var dryRunOption = new Option<bool>("--dry-run", "Preview changes without saving");
+
+        var cmd = new Command("create-cell", "Create a standalone interior cell (not attached to any worldspace) - for hosting placed objects that should never be visited, e.g. persistent storage containers")
+        {
+            pluginArg, editorIdArg, nameOption, dryRunOption
+        };
+
+        cmd.SetHandler((context) =>
+        {
+            var plugin = context.ParseResult.GetValueForArgument(pluginArg);
+            var editorId = context.ParseResult.GetValueForArgument(editorIdArg);
+            var name = context.ParseResult.GetValueForOption(nameOption);
+            var dryRun = context.ParseResult.GetValueForOption(dryRunOption);
+            var json = context.ParseResult.GetValueForOption(_jsonOption);
+            var verbose = context.ParseResult.GetValueForOption(_verboseOption);
+
+            var logger = CreateLogger(json, verbose);
+            var service = new PluginService(logger);
+
+            var loadResult = service.LoadPluginForEdit(plugin);
+            if (!loadResult.Success) { OutputError(loadResult.Error!, json); return; }
+
+            var mod = loadResult.Value!;
+            var builder = new CellBuilder(mod, editorId).AsHiddenUtilityCell();
+            if (!string.IsNullOrEmpty(name)) builder.WithName(name);
+
+            var cell = builder.Build();
+
+            Result saveResult = dryRun
+                ? Result.Ok($"{plugin} (DRY RUN - not saved)")
+                : service.SavePlugin(mod, plugin);
+
+            if (json)
+            {
+                if (saveResult.Success)
+                {
+                    Console.WriteLine(new
+                    {
+                        success = true,
+                        result = new { editorId = cell.EditorID, formId = cell.FormKey.ToString(), dryRun }
+                    }.ToJson());
+                }
+                else
+                {
+                    Console.WriteLine(new { success = false, error = saveResult.Error }.ToJson());
+                    Environment.ExitCode = 1;
+                }
+            }
+            else if (saveResult.Success)
+            {
+                var msg = $"Created cell: {cell.EditorID} ({cell.FormKey})";
+                if (dryRun) msg += " [DRY RUN - not saved]";
+                Console.WriteLine(msg);
+            }
+            else
+            {
+                Console.Error.WriteLine($"Error: {saveResult.Error}");
+                Environment.ExitCode = 1;
+            }
+        });
+
+        return cmd;
+    }
+
+    private static Command CreateAddPlacedObjectLocalCommand()
+    {
+        var pluginArg = new Argument<string>("plugin", "Path to the plugin file");
+        var cellOption = new Option<string>("--cell", "Editor ID of a cell that was created IN THIS SAME plugin (e.g. via 'esp create-cell')") { IsRequired = true };
+        var baseOption = new Option<string>("--base", "FormKey of the base object to place, as 'FORMID:PluginName.esp' e.g. '000808:MyMod.esp'") { IsRequired = true };
+        var posOption = new Option<string>("--pos", "Position as x,y,z") { IsRequired = true };
+        var rotOption = new Option<string>("--rot", "Rotation in degrees as x,y,z (default 0,0,0)");
+        var scaleOption = new Option<float>("--scale", () => 1.0f, "Scale (default 1.0)");
+        var dryRunOption = new Option<bool>("--dry-run", "Preview changes without saving");
+
+        var cmd = new Command("add-placed-object-local", "Add a placed object reference into a cell owned by THIS SAME plugin - simpler and more reliable than 'add-placed-object' for that case, no separate patch/load-order needed")
+        {
+            pluginArg, cellOption, baseOption, posOption, rotOption, scaleOption, dryRunOption
+        };
+
+        cmd.SetHandler((context) =>
+        {
+            var plugin = context.ParseResult.GetValueForArgument(pluginArg);
+            var cellEditorId = context.ParseResult.GetValueForOption(cellOption)!;
+            var baseObj = context.ParseResult.GetValueForOption(baseOption)!;
+            var pos = context.ParseResult.GetValueForOption(posOption)!;
+            var rot = context.ParseResult.GetValueForOption(rotOption);
+            var scale = context.ParseResult.GetValueForOption(scaleOption);
+            var dryRun = context.ParseResult.GetValueForOption(dryRunOption);
+            var json = context.ParseResult.GetValueForOption(_jsonOption);
+            var verbose = context.ParseResult.GetValueForOption(_verboseOption);
+
+            static bool TryParseTriple(string? s, out float x, out float y, out float z)
+            {
+                x = y = z = 0f;
+                if (string.IsNullOrWhiteSpace(s)) return true;
+                var parts = s.Split(',');
+                if (parts.Length != 3) return false;
+                return float.TryParse(parts[0].Trim(), out x)
+                    && float.TryParse(parts[1].Trim(), out y)
+                    && float.TryParse(parts[2].Trim(), out z);
+            }
+
+            if (!TryParseTriple(pos, out var px, out var py, out var pz))
+            {
+                OutputError("Invalid --pos, expected 'x,y,z'", json);
+                return;
+            }
+            if (!TryParseTriple(rot, out var rx, out var ry, out var rz))
+            {
+                OutputError("Invalid --rot, expected 'x,y,z'", json);
+                return;
+            }
+            if (!FormKey.TryFactory(baseObj, out var baseKey))
+            {
+                OutputError($"Invalid base object FormKey format: {baseObj}", json,
+                    suggestions: new[] { "Use format: 000800:PluginName.esp" });
+                return;
+            }
+
+            var logger = CreateLogger(json, verbose);
+            var service = new PluginService(logger);
+
+            var loadResult = service.LoadPluginForEdit(plugin);
+            if (!loadResult.Success) { OutputError(loadResult.Error!, json); return; }
+            var mod = loadResult.Value!;
+
+            var addResult = service.AddPlacedObjectToLocalCell(mod, cellEditorId, baseKey, px, py, pz, rx, ry, rz, scale);
+            if (!addResult.Success) { OutputError(addResult.Error!, json); return; }
+
+            Result saveResult = dryRun
+                ? Result.Ok($"{plugin} (DRY RUN - not saved)")
+                : service.SavePlugin(mod, plugin);
+
+            if (json)
+            {
+                if (saveResult.Success)
+                {
+                    Console.WriteLine(new { success = true, result = new { formId = addResult.Value, cell = cellEditorId, dryRun } }.ToJson());
+                }
+                else
+                {
+                    Console.WriteLine(new { success = false, error = saveResult.Error }.ToJson());
+                    Environment.ExitCode = 1;
+                }
+            }
+            else if (saveResult.Success)
+            {
+                var msg = $"Added placed object {addResult.Value} into cell '{cellEditorId}'";
+                if (dryRun) msg += " [DRY RUN - not saved]";
+                Console.WriteLine(msg);
+            }
+            else
+            {
+                Console.Error.WriteLine($"Error: {saveResult.Error}");
+                Environment.ExitCode = 1;
+            }
+        });
+
+        return cmd;
+    }
+
+    private static Command CreateClearContainerItemsLocalCommand()
+    {
+        var pluginArg = new Argument<string>("plugin", "Path to the plugin file");
+        var containerOption = new Option<string>("--container", "Editor ID of an existing container in THIS plugin") { IsRequired = true };
+        var dryRunOption = new Option<bool>("--dry-run", "Preview changes without saving");
+
+        var cmd = new Command("clear-container-items-local",
+            "Remove ALL starting-stock items from a container in this same plugin, so it can be re-seeded " +
+            "cleanly with add-container-item-local. There is no per-item remove - use this and re-add.")
+        {
+            pluginArg, containerOption, dryRunOption
+        };
+
+        cmd.SetHandler((context) =>
+        {
+            var plugin = context.ParseResult.GetValueForArgument(pluginArg);
+            var containerEditorId = context.ParseResult.GetValueForOption(containerOption)!;
+            var dryRun = context.ParseResult.GetValueForOption(dryRunOption);
+            var json = context.ParseResult.GetValueForOption(_jsonOption);
+            var verbose = context.ParseResult.GetValueForOption(_verboseOption);
+
+            var logger = CreateLogger(json, verbose);
+            var service = new PluginService(logger);
+
+            var loadResult = service.LoadPluginForEdit(plugin);
+            if (!loadResult.Success) { OutputError(loadResult.Error!, json); return; }
+            var mod = loadResult.Value!;
+
+            var clearResult = service.ClearLocalContainerItems(mod, containerEditorId);
+            if (!clearResult.Success) { OutputError(clearResult.Error!, json); return; }
+
+            Result saveResult = dryRun
+                ? Result.Ok($"{plugin} (DRY RUN - not saved)")
+                : service.SavePlugin(mod, plugin);
+
+            if (json)
+            {
+                Console.WriteLine(saveResult.Success
+                    ? (object)new { success = true, result = new { container = containerEditorId, detail = clearResult.Value, dryRun } }.ToJson()
+                    : new { success = false, error = saveResult.Error }.ToJson());
+            }
+            else if (saveResult.Success)
+            {
+                Console.WriteLine($"Cleared container '{containerEditorId}': {clearResult.Value}" + (dryRun ? " [DRY RUN - not saved]" : ""));
+            }
+            else
+            {
+                Console.Error.WriteLine($"Error: {saveResult.Error}");
+                Environment.ExitCode = 1;
+            }
+
+            if (!saveResult.Success) { Environment.ExitCode = 1; }
+        });
+
+        return cmd;
+    }
+
+    private static Command CreateAddContainerItemLocalCommand()
+    {
+        var pluginArg = new Argument<string>("plugin", "Path to the plugin file");
+        var containerOption = new Option<string>("--container", "Editor ID of an existing container in THIS plugin") { IsRequired = true };
+        var itemOption = new Option<string>("--item", "FormKey of the item to add, as 'FORMID:PluginName.esp'") { IsRequired = true };
+        var countOption = new Option<int>("--count", () => 1, "Count to add (default 1)");
+        var dryRunOption = new Option<bool>("--dry-run", "Preview changes without saving");
+
+        var cmd = new Command("add-container-item-local", "Add starting stock to an existing container record in this same plugin")
+        {
+            pluginArg, containerOption, itemOption, countOption, dryRunOption
+        };
+
+        cmd.SetHandler((context) =>
+        {
+            var plugin = context.ParseResult.GetValueForArgument(pluginArg);
+            var containerEditorId = context.ParseResult.GetValueForOption(containerOption)!;
+            var item = context.ParseResult.GetValueForOption(itemOption)!;
+            var count = context.ParseResult.GetValueForOption(countOption);
+            var dryRun = context.ParseResult.GetValueForOption(dryRunOption);
+            var json = context.ParseResult.GetValueForOption(_jsonOption);
+            var verbose = context.ParseResult.GetValueForOption(_verboseOption);
+
+            if (!FormKey.TryFactory(item, out var itemKey))
+            {
+                OutputError($"Invalid --item FormKey format: {item}", json,
+                    suggestions: new[] { "Use format: 000800:PluginName.esp" });
+                return;
+            }
+
+            var logger = CreateLogger(json, verbose);
+            var service = new PluginService(logger);
+
+            var loadResult = service.LoadPluginForEdit(plugin);
+            if (!loadResult.Success) { OutputError(loadResult.Error!, json); return; }
+            var mod = loadResult.Value!;
+
+            var addResult = service.AddItemToLocalContainer(mod, containerEditorId, itemKey, count);
+            if (!addResult.Success) { OutputError(addResult.Error!, json); return; }
+
+            Result saveResult = dryRun
+                ? Result.Ok($"{plugin} (DRY RUN - not saved)")
+                : service.SavePlugin(mod, plugin);
+
+            if (json)
+            {
+                if (saveResult.Success)
+                {
+                    Console.WriteLine(new { success = true, result = new { container = containerEditorId, item, count, dryRun } }.ToJson());
+                }
+                else
+                {
+                    Console.WriteLine(new { success = false, error = saveResult.Error }.ToJson());
+                    Environment.ExitCode = 1;
+                }
+            }
+            else if (saveResult.Success)
+            {
+                var msg = $"Added {count}x {item} to container '{containerEditorId}'";
+                if (dryRun) msg += " [DRY RUN - not saved]";
+                Console.WriteLine(msg);
+            }
+            else
+            {
+                Console.Error.WriteLine($"Error: {saveResult.Error}");
+                Environment.ExitCode = 1;
+            }
+        });
+
+        return cmd;
+    }
+
     private static Command CreateAttachScriptCommand()
     {
         var pluginArg = new Argument<string>("plugin", "Path to the plugin file");
@@ -728,11 +1317,12 @@ public static class EspCommands
         var nameOption = new Option<string>("--name", "Name of the alias to add") { IsRequired = true };
         var scriptOption = new Option<string?>("--script", "Optional script to attach to the new alias");
         var flagsOption = new Option<string?>("--flags", "Comma-separated alias flags (e.g. 'Optional,AllowReuseInQuest,AllowReserved')");
+        var forcedRefOption = new Option<string?>("--forced-ref", "Forced reference FormKey to fill this alias with, as 'FORMID:MODNAME' (e.g. '000014:Skyrim.esm' for the player). Without a fill method an alias can fail to fill, which can prevent the quest from starting.");
         var dryRunOption = new Option<bool>("--dry-run", "Preview changes without saving");
 
         var cmd = new Command("add-alias", "Add a reference alias to a quest, optionally with a script attached")
         {
-            pluginArg, questOption, nameOption, scriptOption, flagsOption, dryRunOption
+            pluginArg, questOption, nameOption, scriptOption, flagsOption, forcedRefOption, dryRunOption
         };
 
         cmd.SetHandler((context) =>
@@ -742,6 +1332,7 @@ public static class EspCommands
             var aliasName = context.ParseResult.GetValueForOption(nameOption)!;
             var scriptName = context.ParseResult.GetValueForOption(scriptOption);
             var flagsStr = context.ParseResult.GetValueForOption(flagsOption);
+            var forcedRef = context.ParseResult.GetValueForOption(forcedRefOption);
             var dryRun = context.ParseResult.GetValueForOption(dryRunOption);
             var json = context.ParseResult.GetValueForOption(_jsonOption);
             var verbose = context.ParseResult.GetValueForOption(_verboseOption);
@@ -774,7 +1365,7 @@ public static class EspCommands
                 return;
             }
 
-            var addResult = service.AddAliasToQuest(quest, aliasName, scriptName, flags);
+            var addResult = service.AddAliasToQuest(quest, aliasName, scriptName, flags, forcedRef);
             if (!addResult.Success) { OutputError(addResult.Error!, json); return; }
             var alias = addResult.Value!;
 
@@ -1100,6 +1691,10 @@ public static class EspCommands
         var pluginArg = new Argument<string>("plugin", "Path to the plugin file");
         var editorIdArg = new Argument<string>("editorId", "Editor ID for the weapon");
         var nameOption = new Option<string?>("--name", "Display name for the weapon");
+        var descriptionOption = new Option<string?>("--description",
+            "Item card description text. Some installed UI mods (e.g. DescriptionFramework) can crash " +
+            "when displaying a weapon with no description set - always set this for weapons the player " +
+            "will actually see in their inventory.");
         var typeOption = new Option<string>("--type", getDefaultValue: () => "sword",
             description: "Weapon type: sword, greatsword, dagger, waraxe, battleaxe, mace, warhammer, bow, crossbow, staff");
         var damageOption = new Option<ushort>("--damage", getDefaultValue: () => 10, description: "Base damage");
@@ -1107,11 +1702,20 @@ public static class EspCommands
         var weightOption = new Option<float>("--weight", getDefaultValue: () => 5, description: "Weight");
         var modelOption = new Option<string?>("--model",
             description: "Model path relative to Data/Meshes (e.g., Weapons\\Iron\\IronSword.nif). Use 'iron-sword', 'steel-sword', 'iron-dagger', or 'hunting-bow' for vanilla presets.");
+        var speedOption = new Option<float?>("--speed", "Attack speed multiplier (vanilla weapons are typically 0.8-1.3)");
+        var reachOption = new Option<float?>("--reach", "Attack reach multiplier (vanilla weapons are typically 0.7-1.5)");
+        var criticalDamageOption = new Option<ushort?>("--critical-damage", "Bonus damage applied on a critical hit");
+        var keywordOption = new Option<string[]?>("--keyword",
+            description: "Add a keyword in format: FormId:ModName.esp (no 0x prefix) or EditorId (e.g., 01E713:Skyrim.esm for WeapTypeDagger). Can be used multiple times.");
+        var boundsOption = new Option<string?>("--bounds",
+            "Object bounds as minX,minY,minZ,maxX,maxY,maxZ (game units). A small non-zero default is " +
+            "already applied automatically - only set this if you know the real dimensions from the mesh.");
         var dryRunOption = new Option<bool>("--dry-run", "Preview changes without saving");
 
         var cmd = new Command("add-weapon", "Add a weapon record to a plugin")
         {
-            pluginArg, editorIdArg, nameOption, typeOption, damageOption, valueOption, weightOption, modelOption, dryRunOption
+            pluginArg, editorIdArg, nameOption, descriptionOption, typeOption, damageOption, valueOption, weightOption, modelOption,
+            speedOption, reachOption, criticalDamageOption, keywordOption, boundsOption, dryRunOption
         };
 
         cmd.SetHandler((context) =>
@@ -1119,11 +1723,17 @@ public static class EspCommands
             var plugin = context.ParseResult.GetValueForArgument(pluginArg);
             var editorId = context.ParseResult.GetValueForArgument(editorIdArg);
             var name = context.ParseResult.GetValueForOption(nameOption);
+            var description = context.ParseResult.GetValueForOption(descriptionOption);
             var type = context.ParseResult.GetValueForOption(typeOption) ?? "sword";
             var damage = context.ParseResult.GetValueForOption(damageOption);
             var value = context.ParseResult.GetValueForOption(valueOption);
             var weight = context.ParseResult.GetValueForOption(weightOption);
             var model = context.ParseResult.GetValueForOption(modelOption);
+            var speed = context.ParseResult.GetValueForOption(speedOption);
+            var reach = context.ParseResult.GetValueForOption(reachOption);
+            var criticalDamage = context.ParseResult.GetValueForOption(criticalDamageOption);
+            var keywords = context.ParseResult.GetValueForOption(keywordOption);
+            var bounds = context.ParseResult.GetValueForOption(boundsOption);
             var dryRun = context.ParseResult.GetValueForOption(dryRunOption);
             var json = context.ParseResult.GetValueForOption(_jsonOption);
             var verbose = context.ParseResult.GetValueForOption(_verboseOption);
@@ -1141,6 +1751,43 @@ public static class EspCommands
                 .WithWeight(weight);
 
             if (!string.IsNullOrEmpty(name)) builder.WithName(name);
+            if (!string.IsNullOrEmpty(description)) builder.WithDescription(description);
+            if (speed.HasValue) builder.WithSpeed(speed.Value);
+            if (reach.HasValue) builder.WithReach(reach.Value);
+            if (criticalDamage.HasValue) builder.WithCriticalDamage(criticalDamage.Value);
+
+            if (!string.IsNullOrEmpty(bounds))
+            {
+                var parts = bounds.Split(',');
+                if (parts.Length != 6 || !parts.All(p => short.TryParse(p.Trim(), out _)))
+                {
+                    OutputError($"Invalid --bounds value '{bounds}' - expected minX,minY,minZ,maxX,maxY,maxZ", json);
+                    return;
+                }
+                var nums = parts.Select(p => short.Parse(p.Trim())).ToArray();
+                builder.WithBounds(nums[0], nums[1], nums[2], nums[3], nums[4], nums[5]);
+            }
+
+            if (keywords != null && keywords.Length > 0)
+            {
+                foreach (var keywordStr in keywords)
+                {
+                    if (Mutagen.Bethesda.Plugins.FormKey.TryFactory(keywordStr, out var keywordFormKey))
+                    {
+                        builder.WithKeyword(keywordFormKey);
+                    }
+                    else
+                    {
+                        var record = mod.EnumerateMajorRecords().FirstOrDefault(r => r.EditorID == keywordStr);
+                        if (record == null)
+                        {
+                            OutputError($"Keyword not found: {keywordStr}", json);
+                            return;
+                        }
+                        builder.WithKeyword(record.FormKey);
+                    }
+                }
+            }
 
             // Apply model if specified
             if (!string.IsNullOrEmpty(model))
@@ -1340,6 +1987,636 @@ public static class EspCommands
                 var msg = $"Added armor: {armor.EditorID} ({armor.FormKey})" + (hasModel ? $" [Model: {armor.WorldModel?.Male?.Model?.File}]" : " [No model - armor will be invisible!]");
                 if (dryRun) msg += " [DRY RUN - not saved]";
                 Console.WriteLine(msg);
+            }
+            else
+            {
+                Console.Error.WriteLine($"Error: {saveResult.Error}");
+                Environment.ExitCode = 1;
+            }
+        });
+
+        return cmd;
+    }
+
+    private static Command CreateAddRecipeCommand()
+    {
+        var pluginArg = new Argument<string>("plugin", "Path to the plugin file");
+        var editorIdArg = new Argument<string>("editorId", "Editor ID for the recipe");
+        var createdObjectOption = new Option<string>("--created-object", "FormKey of the item this recipe creates (format: 0x000800 or hex:PluginName.esp)") { IsRequired = true };
+        var createdCountOption = new Option<ushort>("--created-count", getDefaultValue: () => 1, description: "Quantity created");
+        var workbenchOption = new Option<string>("--workbench", "FormKey of the crafting station keyword (e.g. CraftingTanningRack, CraftingSmithingForge)") { IsRequired = true };
+        var itemOption = new Option<string>("--item", "FormKey of the required ingredient") { IsRequired = true };
+        var itemCountOption = new Option<int>("--item-count", getDefaultValue: () => 1, description: "Quantity of the ingredient required");
+        var dryRunOption = new Option<bool>("--dry-run", "Preview changes without saving");
+
+        var cmd = new Command("add-recipe", "Add a crafting recipe (ConstructibleObject) record to a plugin - no perk condition, single ingredient")
+        {
+            pluginArg, editorIdArg, createdObjectOption, createdCountOption, workbenchOption, itemOption, itemCountOption, dryRunOption
+        };
+
+        cmd.SetHandler((context) =>
+        {
+            var plugin = context.ParseResult.GetValueForArgument(pluginArg);
+            var editorId = context.ParseResult.GetValueForArgument(editorIdArg);
+            var createdObjectStr = context.ParseResult.GetValueForOption(createdObjectOption)!;
+            var createdCount = context.ParseResult.GetValueForOption(createdCountOption);
+            var workbenchStr = context.ParseResult.GetValueForOption(workbenchOption)!;
+            var itemStr = context.ParseResult.GetValueForOption(itemOption)!;
+            var itemCount = context.ParseResult.GetValueForOption(itemCountOption);
+            var dryRun = context.ParseResult.GetValueForOption(dryRunOption);
+            var json = context.ParseResult.GetValueForOption(_jsonOption);
+            var verbose = context.ParseResult.GetValueForOption(_verboseOption);
+
+            var logger = CreateLogger(json, verbose);
+            var service = new PluginService(logger);
+
+            if (!FormKey.TryFactory(createdObjectStr, out var createdObjectKey))
+            {
+                OutputError($"Invalid --created-object FormKey: {createdObjectStr}", json);
+                return;
+            }
+            if (!FormKey.TryFactory(workbenchStr, out var workbenchKey))
+            {
+                OutputError($"Invalid --workbench FormKey: {workbenchStr}", json);
+                return;
+            }
+            if (!FormKey.TryFactory(itemStr, out var itemKey))
+            {
+                OutputError($"Invalid --item FormKey: {itemStr}", json);
+                return;
+            }
+
+            var loadResult = service.LoadPluginForEdit(plugin);
+            if (!loadResult.Success) { OutputError(loadResult.Error!, json); return; }
+
+            var mod = loadResult.Value!;
+            var recipe = new RecipeBuilder(mod, editorId)
+                .Creates(createdObjectKey, createdCount)
+                .AtWorkbench(workbenchKey)
+                .RequiresItem(itemKey, itemCount)
+                .Build();
+
+            Result saveResult;
+            if (dryRun)
+            {
+                saveResult = Result.Ok($"{plugin} (DRY RUN - not saved)");
+            }
+            else
+            {
+                saveResult = service.SavePlugin(mod, plugin);
+            }
+
+            if (json)
+            {
+                if (saveResult.Success)
+                {
+                    Console.WriteLine(new
+                    {
+                        success = true,
+                        result = new
+                        {
+                            editorId = recipe.EditorID,
+                            formId = recipe.FormKey.ToString(),
+                            createdObject = createdObjectKey.ToString(),
+                            createdCount,
+                            workbench = workbenchKey.ToString(),
+                            item = itemKey.ToString(),
+                            itemCount,
+                            dryRun
+                        }
+                    }.ToJson());
+                }
+                else
+                {
+                    Console.WriteLine(new { success = false, error = saveResult.Error }.ToJson());
+                    Environment.ExitCode = 1;
+                }
+            }
+            else if (saveResult.Success)
+            {
+                var msg = $"Added recipe: {recipe.EditorID} ({recipe.FormKey}) creates {createdObjectKey} x{createdCount} at {workbenchKey} from {itemKey} x{itemCount}";
+                if (dryRun) msg += " [DRY RUN - not saved]";
+                Console.WriteLine(msg);
+            }
+            else
+            {
+                Console.Error.WriteLine($"Error: {saveResult.Error}");
+                Environment.ExitCode = 1;
+            }
+        });
+
+        return cmd;
+    }
+
+    private static Command CreateSetArmorNameCommand()
+    {
+        var pluginArg = new Argument<string>("plugin", "Path to the plugin file");
+        var editorIdArg = new Argument<string>("editorId", "Editor ID of the armor record to edit");
+        var nameOption = new Option<string>("--name", "New display name (FULL) for the armor") { IsRequired = true };
+        var dryRunOption = new Option<bool>("--dry-run", "Preview changes without saving");
+
+        var cmd = new Command("set-armor-name", "Set an Armor record's display name (FULL)")
+        {
+            pluginArg, editorIdArg, nameOption, dryRunOption
+        };
+
+        cmd.SetHandler((context) =>
+        {
+            var plugin = context.ParseResult.GetValueForArgument(pluginArg);
+            var editorId = context.ParseResult.GetValueForArgument(editorIdArg);
+            var name = context.ParseResult.GetValueForOption(nameOption)!;
+            var dryRun = context.ParseResult.GetValueForOption(dryRunOption);
+            var json = context.ParseResult.GetValueForOption(_jsonOption);
+            var verbose = context.ParseResult.GetValueForOption(_verboseOption);
+
+            var logger = CreateLogger(json, verbose);
+            var service = new PluginService(logger);
+
+            var loadResult = service.LoadPluginForEdit(plugin);
+            if (!loadResult.Success) { OutputError(loadResult.Error!, json); return; }
+
+            var mod = loadResult.Value!;
+            var armor = mod.Armors.FirstOrDefault(a => a.EditorID == editorId);
+            if (armor == null)
+            {
+                OutputError($"No Armor record with EditorID '{editorId}' found in {plugin}", json);
+                return;
+            }
+
+            var previousName = armor.Name?.String;
+            armor.Name = name;
+
+            Result saveResult;
+            if (dryRun)
+            {
+                saveResult = Result.Ok($"{plugin} (DRY RUN - not saved)");
+            }
+            else
+            {
+                saveResult = service.SavePlugin(mod, plugin);
+            }
+
+            if (json)
+            {
+                if (saveResult.Success)
+                {
+                    Console.WriteLine(new
+                    {
+                        success = true,
+                        result = new { editorId = armor.EditorID, formId = armor.FormKey.ToString(), previousName, name, dryRun }
+                    }.ToJson());
+                }
+                else
+                {
+                    Console.WriteLine(new { success = false, error = saveResult.Error }.ToJson());
+                    Environment.ExitCode = 1;
+                }
+            }
+            else if (saveResult.Success)
+            {
+                var msg = $"Renamed {editorId}: '{previousName}' -> '{name}'";
+                if (dryRun) msg += " [DRY RUN - not saved]";
+                Console.WriteLine(msg);
+            }
+            else
+            {
+                Console.Error.WriteLine($"Error: {saveResult.Error}");
+                Environment.ExitCode = 1;
+            }
+        });
+
+        return cmd;
+    }
+
+    private static Command CreateClearArmorEnchantmentCommand()
+    {
+        var pluginArg = new Argument<string>("plugin", "Path to the plugin file");
+        var editorIdArg = new Argument<string>("editorId", "Editor ID of the armor record to edit");
+        var dryRunOption = new Option<bool>("--dry-run", "Preview changes without saving");
+
+        var cmd = new Command("clear-armor-enchantment",
+            "Remove an Armor record's attached ObjectEffect (enchantment) entirely - clears the armor's " +
+            "EITM link and deletes the ObjectEffect and every MagicEffect it references, as long as nothing " +
+            "else in the plugin still points at them.")
+        {
+            pluginArg, editorIdArg, dryRunOption
+        };
+
+        cmd.SetHandler((context) =>
+        {
+            var plugin = context.ParseResult.GetValueForArgument(pluginArg);
+            var editorId = context.ParseResult.GetValueForArgument(editorIdArg);
+            var dryRun = context.ParseResult.GetValueForOption(dryRunOption);
+            var json = context.ParseResult.GetValueForOption(_jsonOption);
+            var verbose = context.ParseResult.GetValueForOption(_verboseOption);
+
+            var logger = CreateLogger(json, verbose);
+            var service = new PluginService(logger);
+
+            var loadResult = service.LoadPluginForEdit(plugin);
+            if (!loadResult.Success) { OutputError(loadResult.Error!, json); return; }
+
+            var mod = loadResult.Value!;
+            var armor = mod.Armors.FirstOrDefault(a => a.EditorID == editorId);
+            if (armor == null)
+            {
+                OutputError($"No Armor record with EditorID '{editorId}' found in {plugin}", json);
+                return;
+            }
+
+            if (armor.ObjectEffect.IsNull)
+            {
+                OutputError($"Armor '{editorId}' has no attached enchantment - nothing to clear.", json);
+                return;
+            }
+
+            var enchantment = mod.ObjectEffects.FirstOrDefault(e => e.FormKey == armor.ObjectEffect.FormKey);
+            var removedMgefEditorIds = new List<string>();
+            armor.ObjectEffect.Clear();
+
+            if (enchantment != null)
+            {
+                var mgefFormKeys = enchantment.Effects.Select(e => e.BaseEffect.FormKey).Distinct().ToList();
+                foreach (var mgefKey in mgefFormKeys)
+                {
+                    var mgef = mod.MagicEffects.FirstOrDefault(m => m.FormKey == mgefKey);
+                    if (mgef != null)
+                    {
+                        removedMgefEditorIds.Add(mgef.EditorID ?? mgef.FormKey.ToString());
+                        mod.MagicEffects.Remove(mgef);
+                    }
+                }
+                mod.ObjectEffects.Remove(enchantment);
+            }
+
+            Result saveResult;
+            if (dryRun)
+            {
+                saveResult = Result.Ok($"{plugin} (DRY RUN - not saved)");
+            }
+            else
+            {
+                saveResult = service.SavePlugin(mod, plugin);
+            }
+
+            if (json)
+            {
+                if (saveResult.Success)
+                {
+                    Console.WriteLine(new
+                    {
+                        success = true,
+                        result = new
+                        {
+                            editorId = armor.EditorID,
+                            formId = armor.FormKey.ToString(),
+                            removedEnchantment = enchantment?.EditorID,
+                            removedMagicEffects = removedMgefEditorIds,
+                            dryRun
+                        }
+                    }.ToJson());
+                }
+                else
+                {
+                    Console.WriteLine(new { success = false, error = saveResult.Error }.ToJson());
+                    Environment.ExitCode = 1;
+                }
+            }
+            else if (saveResult.Success)
+            {
+                var msg = $"Cleared enchantment from {editorId}" +
+                    (enchantment != null ? $" - removed {enchantment.EditorID} and {removedMgefEditorIds.Count} magic effect(s)" : "");
+                if (dryRun) msg += " [DRY RUN - not saved]";
+                Console.WriteLine(msg);
+            }
+            else
+            {
+                Console.Error.WriteLine($"Error: {saveResult.Error}");
+                Environment.ExitCode = 1;
+            }
+        });
+
+        return cmd;
+    }
+
+    private static Command CreateRemoveKeywordCommand()
+    {
+        var pluginArg = new Argument<string>("plugin", "Path to the plugin file");
+        var editorIdArg = new Argument<string>("editorId", "Editor ID of the armor record to edit");
+        var keywordOption = new Option<string>("--keyword", "FormKey of the keyword to remove (format: 0x000800 or hex:PluginName.esp)") { IsRequired = true };
+        var dryRunOption = new Option<bool>("--dry-run", "Preview changes without saving");
+
+        var cmd = new Command("remove-keyword", "Remove a keyword FormLink from an Armor record already present in the plugin (e.g. after clone-record, to drop a dependency on the source plugin)")
+        {
+            pluginArg, editorIdArg, keywordOption, dryRunOption
+        };
+
+        cmd.SetHandler((context) =>
+        {
+            var plugin = context.ParseResult.GetValueForArgument(pluginArg);
+            var editorId = context.ParseResult.GetValueForArgument(editorIdArg);
+            var keywordStr = context.ParseResult.GetValueForOption(keywordOption)!;
+            var dryRun = context.ParseResult.GetValueForOption(dryRunOption);
+            var json = context.ParseResult.GetValueForOption(_jsonOption);
+            var verbose = context.ParseResult.GetValueForOption(_verboseOption);
+
+            var logger = CreateLogger(json, verbose);
+            var service = new PluginService(logger);
+
+            if (!FormKey.TryFactory(keywordStr, out var keywordKey))
+            {
+                OutputError($"Invalid --keyword FormKey: {keywordStr}", json);
+                return;
+            }
+
+            var loadResult = service.LoadPluginForEdit(plugin);
+            if (!loadResult.Success) { OutputError(loadResult.Error!, json); return; }
+
+            var mod = loadResult.Value!;
+            var armor = mod.Armors.FirstOrDefault(a => a.EditorID == editorId);
+            if (armor == null)
+            {
+                OutputError($"No Armor record with EditorID '{editorId}' found in {plugin}", json);
+                return;
+            }
+
+            var removed = armor.Keywords?.RemoveAll(k => k.FormKey == keywordKey) ?? 0;
+
+            Result saveResult;
+            if (dryRun)
+            {
+                saveResult = Result.Ok($"{plugin} (DRY RUN - not saved)");
+            }
+            else
+            {
+                saveResult = service.SavePlugin(mod, plugin);
+            }
+
+            if (json)
+            {
+                if (saveResult.Success)
+                {
+                    Console.WriteLine(new
+                    {
+                        success = true,
+                        result = new { editorId = armor.EditorID, formId = armor.FormKey.ToString(), removedCount = removed, dryRun }
+                    }.ToJson());
+                }
+                else
+                {
+                    Console.WriteLine(new { success = false, error = saveResult.Error }.ToJson());
+                    Environment.ExitCode = 1;
+                }
+            }
+            else if (saveResult.Success)
+            {
+                var msg = $"Removed {removed} keyword reference(s) matching {keywordKey} from {editorId}";
+                if (dryRun) msg += " [DRY RUN - not saved]";
+                Console.WriteLine(msg);
+            }
+            else
+            {
+                Console.Error.WriteLine($"Error: {saveResult.Error}");
+                Environment.ExitCode = 1;
+            }
+        });
+
+        return cmd;
+    }
+
+    private static Command CreateImportArmorCommand()
+    {
+        var sourcePluginArg = new Argument<string>("sourcePlugin", "Path to the plugin that owns the armor");
+        var targetPluginArg = new Argument<string>("targetPlugin", "Path to the plugin to import into");
+        var sourceEditorIdArg = new Argument<string>("sourceEditorId", "EditorID of the Armor record to import");
+        var newEditorIdArg = new Argument<string>("newEditorId", "EditorID for the imported Armor record");
+
+        var cmd = new Command(
+            "import-armor",
+            "Deep-copy an Armor record (and every ArmorAddon it references via Armature) from another plugin into the target plugin as brand-new, fully self-contained local records - the target no longer needs the source plugin as a master for this armor. World model paths (NIF/texture references) are copied as-is; the actual mesh/texture files must already exist under the target's Data folder.")
+        {
+            sourcePluginArg, targetPluginArg, sourceEditorIdArg, newEditorIdArg
+        };
+
+        cmd.SetHandler((context) =>
+        {
+            var sourcePlugin = context.ParseResult.GetValueForArgument(sourcePluginArg);
+            var targetPlugin = context.ParseResult.GetValueForArgument(targetPluginArg);
+            var sourceEditorId = context.ParseResult.GetValueForArgument(sourceEditorIdArg);
+            var newEditorId = context.ParseResult.GetValueForArgument(newEditorIdArg);
+            var json = context.ParseResult.GetValueForOption(_jsonOption);
+            var verbose = context.ParseResult.GetValueForOption(_verboseOption);
+
+            var logger = CreateLogger(json, verbose);
+            var service = new PluginService(logger);
+
+            var sourceLoadResult = service.LoadPluginReadOnly(sourcePlugin);
+            if (!sourceLoadResult.Success) { OutputError(sourceLoadResult.Error!, json); return; }
+            var sourceMod = sourceLoadResult.Value!;
+            var linkCache = sourceMod.ToImmutableLinkCache();
+
+            var sourceArmor = sourceMod.Armors.FirstOrDefault(a => a.EditorID == sourceEditorId);
+            if (sourceArmor == null)
+            {
+                OutputError($"No Armor record with EditorID '{sourceEditorId}' found in {sourcePlugin}", json);
+                return;
+            }
+
+            var targetLoadResult = service.LoadPluginForEdit(targetPlugin);
+            if (!targetLoadResult.Success) { OutputError(targetLoadResult.Error!, json); return; }
+            var targetMod = targetLoadResult.Value!;
+
+            void EnsureMaster(ModKey modKey)
+            {
+                if (modKey == targetMod.ModKey) return;
+                if (!targetMod.ModHeader.MasterReferences.Any(m => m.Master == modKey))
+                {
+                    targetMod.ModHeader.MasterReferences.Add(new MasterReference { Master = modKey });
+                }
+            }
+
+            // Duplicate every ArmorAddon the source armor references, tracking old -> new FormKey
+            // so the duplicated Armor's own Armature list can be repointed at the local copies.
+            var armaRemap = new Dictionary<FormKey, FormKey>();
+            var importedArmaEditorIds = new List<string>();
+            int armaIndex = 0;
+            foreach (var armaLink in sourceArmor.Armature)
+            {
+                if (!linkCache.TryResolve<IArmorAddonGetter>(armaLink.FormKey, out var sourceArma))
+                {
+                    OutputError($"Could not resolve ArmorAddon {armaLink.FormKey} referenced by {sourceEditorId}'s Armature", json);
+                    return;
+                }
+
+                var newArma = ArmorAddonMixIn.Duplicate(sourceArma, targetMod.GetNextFormKey(), (Mutagen.Bethesda.Skyrim.ArmorAddon.TranslationMask?)null);
+                newArma.EditorID = $"{newEditorId}_AA{(armaIndex == 0 ? "" : armaIndex.ToString())}";
+                targetMod.ArmorAddons.Add(newArma);
+                armaRemap[armaLink.FormKey] = newArma.FormKey;
+                importedArmaEditorIds.Add(newArma.EditorID!);
+                armaIndex++;
+
+                foreach (var kw in newArma.Race.FormKey.IsNull ? Array.Empty<ModKey>() : new[] { newArma.Race.FormKey.ModKey })
+                {
+                    EnsureMaster(kw);
+                }
+            }
+
+            var newArmor = ArmorMixIn.Duplicate(sourceArmor, targetMod.GetNextFormKey(), (Mutagen.Bethesda.Skyrim.Armor.TranslationMask?)null);
+            newArmor.EditorID = newEditorId;
+            var remappedArmature = newArmor.Armature
+                .Select(link => armaRemap.TryGetValue(link.FormKey, out var remapped)
+                    ? new Mutagen.Bethesda.Plugins.FormLink<IArmorAddonGetter>(remapped)
+                    : link)
+                .ToList();
+            newArmor.Armature.Clear();
+            newArmor.Armature.AddRange(remappedArmature);
+
+            // The armor's ObjectEffect (EITM - an attached enchantment, e.g. a constant-effect
+            // carry-weight bonus) is easy to miss since it doesn't show up in view-record's
+            // simplified property dump. Duplicate it too so the armor doesn't silently keep a
+            // dependency on the source plugin through this one field.
+            string? importedEnchantmentEditorId = null;
+            if (!newArmor.ObjectEffect.IsNull)
+            {
+                if (linkCache.TryResolve<IObjectEffectGetter>(newArmor.ObjectEffect.FormKey, out var sourceEnchantment))
+                {
+                    var newEnchantment = ObjectEffectMixIn.Duplicate(sourceEnchantment, targetMod.GetNextFormKey(), (Mutagen.Bethesda.Skyrim.ObjectEffect.TranslationMask?)null);
+                    newEnchantment.EditorID = $"{newEditorId}_ENCH";
+
+                    // Effect entries can reference a MagicEffect (MGEF) local to the source
+                    // plugin too (e.g. a custom "+carry weight" effect) - easy to miss since it's
+                    // nested two levels deep from the armor. Duplicate any that belong to the
+                    // source plugin specifically; leave vanilla/other-plugin ones as external
+                    // links (those plugins are expected to already be present).
+                    int mgefIndex = 0;
+                    foreach (var effect in newEnchantment.Effects)
+                    {
+                        if (effect.BaseEffect.IsNull || effect.BaseEffect.FormKey.ModKey != sourceMod.ModKey)
+                        {
+                            continue;
+                        }
+                        if (!linkCache.TryResolve<IMagicEffectGetter>(effect.BaseEffect.FormKey, out var sourceMagicEffect))
+                        {
+                            OutputError($"Could not resolve MagicEffect {effect.BaseEffect.FormKey} referenced by {sourceEditorId}'s enchantment", json);
+                            return;
+                        }
+                        var newMagicEffect = MagicEffectMixIn.Duplicate(sourceMagicEffect, targetMod.GetNextFormKey(), (Mutagen.Bethesda.Skyrim.MagicEffect.TranslationMask?)null);
+                        newMagicEffect.EditorID = $"{newEditorId}_MGEF{(mgefIndex == 0 ? "" : mgefIndex.ToString())}";
+                        targetMod.MagicEffects.Add(newMagicEffect);
+                        effect.BaseEffect.SetTo(newMagicEffect.FormKey);
+                        mgefIndex++;
+                    }
+
+                    targetMod.ObjectEffects.Add(newEnchantment);
+                    newArmor.ObjectEffect.SetTo(newEnchantment.FormKey);
+                    importedEnchantmentEditorId = newEnchantment.EditorID;
+
+                    if (!newEnchantment.BaseEnchantment.IsNull)
+                    {
+                        EnsureMaster(newEnchantment.BaseEnchantment.FormKey.ModKey);
+                    }
+                }
+                else
+                {
+                    OutputError($"Could not resolve ObjectEffect {newArmor.ObjectEffect.FormKey} referenced by {sourceEditorId}'s enchantment slot", json);
+                    return;
+                }
+            }
+
+            targetMod.Armors.Add(newArmor);
+
+            // Any remaining FormLinks (keywords, race, etc.) still point wherever they originally
+            // did - ensure those plugins are declared as masters. Use remove-keyword afterward if
+            // you want to drop specific foreign keyword references instead of mastering them.
+            foreach (var kwLink in newArmor.Keywords ?? Enumerable.Empty<Mutagen.Bethesda.Plugins.IFormLinkGetter<IKeywordGetter>>())
+            {
+                EnsureMaster(kwLink.FormKey.ModKey);
+            }
+            if (!newArmor.Race.IsNull)
+            {
+                EnsureMaster(newArmor.Race.FormKey.ModKey);
+            }
+
+            var saveResult = service.SavePlugin(targetMod, targetPlugin);
+
+            if (json)
+            {
+                if (saveResult.Success)
+                {
+                    Console.WriteLine(new
+                    {
+                        success = true,
+                        result = new
+                        {
+                            armorEditorId = newArmor.EditorID,
+                            armorFormId = newArmor.FormKey.ToString(),
+                            armorAddons = importedArmaEditorIds,
+                            enchantment = importedEnchantmentEditorId
+                        }
+                    }.ToJson());
+                }
+                else
+                {
+                    Console.WriteLine(new { success = false, error = saveResult.Error }.ToJson());
+                    Environment.ExitCode = 1;
+                }
+            }
+            else if (saveResult.Success)
+            {
+                var enchMsg = importedEnchantmentEditorId != null ? $" and enchantment {importedEnchantmentEditorId}" : "";
+                Console.WriteLine($"Imported armor: {newArmor.EditorID} ({newArmor.FormKey}) with {importedArmaEditorIds.Count} ArmorAddon(s): {string.Join(", ", importedArmaEditorIds)}{enchMsg}");
+            }
+            else
+            {
+                Console.Error.WriteLine($"Error: {saveResult.Error}");
+                Environment.ExitCode = 1;
+            }
+        });
+
+        return cmd;
+    }
+
+    private static Command CreateRemoveMasterCommand()
+    {
+        var pluginArg = new Argument<string>("plugin", "Path to the plugin file");
+        var masterArg = new Argument<string>("masterFileName", "Filename of the master to remove (e.g. Dr_Bandolier.esp)");
+
+        var cmd = new Command(
+            "remove-master",
+            "Remove a MasterReference entry from a plugin's header. Does NOT scan records for remaining FormLinks to that master - only use once you've confirmed (e.g. via remove-keyword) that nothing in the plugin references it anymore, or the file will fail to resolve those references at load time.")
+        {
+            pluginArg, masterArg
+        };
+
+        cmd.SetHandler((context) =>
+        {
+            var plugin = context.ParseResult.GetValueForArgument(pluginArg);
+            var masterFileName = context.ParseResult.GetValueForArgument(masterArg);
+            var json = context.ParseResult.GetValueForOption(_jsonOption);
+            var verbose = context.ParseResult.GetValueForOption(_verboseOption);
+
+            var logger = CreateLogger(json, verbose);
+            var service = new PluginService(logger);
+
+            var loadResult = service.LoadPluginForEdit(plugin);
+            if (!loadResult.Success) { OutputError(loadResult.Error!, json); return; }
+
+            var mod = loadResult.Value!;
+            var masterKey = ModKey.FromFileName(masterFileName);
+            var removed = mod.ModHeader.MasterReferences.RemoveAll(m => m.Master == masterKey);
+
+            var saveResult = service.SavePlugin(mod, plugin);
+
+            if (json)
+            {
+                Console.WriteLine(saveResult.Success
+                    ? new { success = true, result = new { removed } }.ToJson()
+                    : new { success = false, error = saveResult.Error }.ToJson());
+                if (!saveResult.Success) Environment.ExitCode = 1;
+            }
+            else if (saveResult.Success)
+            {
+                Console.WriteLine(removed > 0 ? $"Removed master: {masterFileName}" : $"Master {masterFileName} was not present");
             }
             else
             {
@@ -2185,12 +3462,158 @@ public static class EspCommands
         return cmd;
     }
 
+    private static Command CreateSetArmorAddonModelCommand()
+    {
+        var pluginArg = new Argument<string>("plugin", "Path to the plugin file");
+        var editorIdArg = new Argument<string>("editorId", "Editor ID of the ArmorAddon to modify");
+        var maleOption = new Option<string?>("--male", "Male world model path, relative to Data (e.g. armor\\foo\\bar.nif)");
+        var femaleOption = new Option<string?>("--female", "Female world model path, relative to Data");
+        var dryRunOption = new Option<bool>("--dry-run", "Preview changes without saving");
+
+        var cmd = new Command("set-armor-addon-model",
+            "Set an ArmorAddon's male/female world model paths. Note Skyrim appends the _0/_1 body-weight " +
+            "suffix itself - the path stored here must NOT include it, or body-weight fitting breaks.")
+        {
+            pluginArg, editorIdArg, maleOption, femaleOption, dryRunOption
+        };
+
+        cmd.SetHandler((context) =>
+        {
+            var plugin = context.ParseResult.GetValueForArgument(pluginArg);
+            var editorId = context.ParseResult.GetValueForArgument(editorIdArg);
+            var male = context.ParseResult.GetValueForOption(maleOption);
+            var female = context.ParseResult.GetValueForOption(femaleOption);
+            var dryRun = context.ParseResult.GetValueForOption(dryRunOption);
+            var json = context.ParseResult.GetValueForOption(_jsonOption);
+            var verbose = context.ParseResult.GetValueForOption(_verboseOption);
+
+            var logger = CreateLogger(json, verbose);
+            var service = new PluginService(logger);
+
+            var loadResult = service.LoadPluginForEdit(plugin);
+            if (!loadResult.Success) { OutputError(loadResult.Error!, json); return; }
+
+            var mod = loadResult.Value!;
+            var addon = mod.ArmorAddons.FirstOrDefault(a =>
+                a.EditorID?.Equals(editorId, StringComparison.OrdinalIgnoreCase) == true);
+            if (addon == null)
+            {
+                OutputError($"ArmorAddon '{editorId}' not found in {Path.GetFileName(plugin)}.", json);
+                return;
+            }
+
+            addon.WorldModel ??= new GenderedItem<Model?>(null, null);
+
+            if (!string.IsNullOrEmpty(male))
+            {
+                addon.WorldModel.Male ??= new Model();
+                addon.WorldModel.Male.File.GivenPath = male;
+            }
+            if (!string.IsNullOrEmpty(female))
+            {
+                addon.WorldModel.Female ??= new Model();
+                addon.WorldModel.Female.File.GivenPath = female;
+            }
+
+            Result saveResult = dryRun
+                ? Result.Ok($"{plugin} (DRY RUN - not saved)")
+                : service.SavePlugin(mod, plugin);
+
+            if (json)
+            {
+                Console.WriteLine(saveResult.Success
+                    ? (object)new { success = true, result = new { editorId = addon.EditorID, male, female, dryRun } }.ToJson()
+                    : new { success = false, error = saveResult.Error }.ToJson());
+            }
+            else if (saveResult.Success)
+            {
+                Console.WriteLine($"Updated '{addon.EditorID}' world model(s):");
+                if (!string.IsNullOrEmpty(male)) { Console.WriteLine($"  male:   {male}"); }
+                if (!string.IsNullOrEmpty(female)) { Console.WriteLine($"  female: {female}"); }
+            }
+            else
+            {
+                Console.Error.WriteLine($"Error: {saveResult.Error}");
+                Environment.ExitCode = 1;
+            }
+        });
+
+        return cmd;
+    }
+
+    private static Command CreateAddKeywordCommand()
+    {
+        var pluginArg = new Argument<string>("plugin", "Path to the plugin file");
+        var editorIdArg = new Argument<string>("editorId", "Editor ID for the keyword");
+        var dryRunOption = new Option<bool>("--dry-run", "Preview changes without saving");
+
+        var cmd = new Command("add-keyword",
+            "Add a Keyword (KYWD) record to a plugin. Useful as a stable tag for runtime patchers " +
+            "such as SkyPatcher to attach onto records the plugin does not own.")
+        {
+            pluginArg, editorIdArg, dryRunOption
+        };
+
+        cmd.SetHandler((context) =>
+        {
+            var plugin = context.ParseResult.GetValueForArgument(pluginArg);
+            var editorId = context.ParseResult.GetValueForArgument(editorIdArg);
+            var dryRun = context.ParseResult.GetValueForOption(dryRunOption);
+            var json = context.ParseResult.GetValueForOption(_jsonOption);
+            var verbose = context.ParseResult.GetValueForOption(_verboseOption);
+
+            var logger = CreateLogger(json, verbose);
+            var service = new PluginService(logger);
+
+            var loadResult = service.LoadPluginForEdit(plugin);
+            if (!loadResult.Success) { OutputError(loadResult.Error!, json); return; }
+
+            var mod = loadResult.Value!;
+
+            // Refuse duplicates rather than silently creating a second keyword with the same
+            // EditorID - a patcher matching by EditorID would then bind to an arbitrary one.
+            var existing = mod.Keywords.FirstOrDefault(k =>
+                k.EditorID?.Equals(editorId, StringComparison.OrdinalIgnoreCase) == true);
+            if (existing != null)
+            {
+                OutputError($"Keyword '{editorId}' already exists in this plugin ({existing.FormKey}).", json);
+                return;
+            }
+
+            var keyword = new KeywordBuilder(mod, editorId).Build();
+
+            Result saveResult = dryRun
+                ? Result.Ok($"{plugin} (DRY RUN - not saved)")
+                : service.SavePlugin(mod, plugin);
+
+            if (json)
+            {
+                Console.WriteLine(saveResult.Success
+                    ? (object)new { success = true, result = new { editorId = keyword.EditorID, formId = keyword.FormKey.ToString(), dryRun } }.ToJson()
+                    : new { success = false, error = saveResult.Error }.ToJson());
+            }
+            else if (saveResult.Success)
+            {
+                Console.WriteLine($"Added keyword '{keyword.EditorID}' ({keyword.FormKey})");
+            }
+            else
+            {
+                Console.Error.WriteLine($"Error: {saveResult.Error}");
+                Environment.ExitCode = 1;
+            }
+
+            if (!saveResult.Success) { Environment.ExitCode = 1; }
+        });
+
+        return cmd;
+    }
+
     private static Command CreateAddFormListCommand()
     {
         var pluginArg = new Argument<string>("plugin", "Path to the plugin file");
         var editorIdArg = new Argument<string>("editorId", "Editor ID for the form list");
         var addFormOption = new Option<string[]?>("--add-form",
-            description: "Add form in format: ModName.esp:0xFormId or EditorId. Can be used multiple times.");
+            description: "Add form in format: FormId:ModName.esp (no 0x prefix) or EditorId. Can be used multiple times.");
         var dryRunOption = new Option<bool>("--dry-run", "Preview changes without saving");
 
         var cmd = new Command("add-form-list", "Add a form list record to a plugin")
@@ -3054,6 +4477,169 @@ public static class EspCommands
         return cmd;
     }
 
+    private static Command CreateRemoveScriptCommand()
+    {
+        var sourceArg = new Argument<string>("source", "Path to the source plugin");
+        var outputOption = new Option<string>(
+            aliases: new[] { "--output", "-o" },
+            description: "Name of the output patch plugin");
+        var typeOption = new Option<string?>("--type", "Record type to filter");
+        var searchOption = new Option<string?>("--search", "Search pattern for EditorIDs");
+        var editorIdsOption = new Option<string?>("--editor-ids", "Comma-separated list of EditorIDs");
+        var scriptNameOption = new Option<string?>(
+            "--script",
+            "Name of the script to remove (without .pex). Omit to strip ALL scripts (the entire VirtualMachineAdapter) from each matched record");
+        var dataFolderOption = new Option<string?>("--data-folder", "Data folder path");
+        var lightOption = new Option<bool>("--light", "Flag the output patch as ESL (light master)");
+
+        outputOption.IsRequired = true;
+
+        var cmd = new Command(
+            "remove-script",
+            "Remove Papyrus script data (VMAD) from one or more records, creating an override patch. Works on any record type that carries scripts (Book, Weapon, Armor, NPC, Container, etc.)")
+        {
+            sourceArg,
+            outputOption,
+            typeOption,
+            searchOption,
+            editorIdsOption,
+            scriptNameOption,
+            dataFolderOption,
+            lightOption
+        };
+
+        cmd.SetHandler((context) =>
+        {
+            var source = context.ParseResult.GetValueForArgument(sourceArg);
+            var output = context.ParseResult.GetValueForOption(outputOption);
+            var type = context.ParseResult.GetValueForOption(typeOption);
+            var search = context.ParseResult.GetValueForOption(searchOption);
+            var editorIdsStr = context.ParseResult.GetValueForOption(editorIdsOption);
+            var scriptName = context.ParseResult.GetValueForOption(scriptNameOption);
+            var dataFolder = context.ParseResult.GetValueForOption(dataFolderOption);
+            var light = context.ParseResult.GetValueForOption(lightOption);
+            var json = context.ParseResult.GetValueForOption(_jsonOption);
+            var verbose = context.ParseResult.GetValueForOption(_verboseOption);
+
+            var logger = CreateLogger(json, verbose);
+            var service = new PluginService(logger);
+
+            string[]? editorIds = null;
+            if (!string.IsNullOrEmpty(editorIdsStr))
+            {
+                editorIds = editorIdsStr.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+            }
+
+            var result = service.RemoveScript(source!, type, search, editorIds, scriptName, output!, dataFolder, light);
+
+            if (json)
+            {
+                Console.WriteLine(result.ToJson(true));
+            }
+            else if (result.Success && result.Value != null)
+            {
+                var batchResult = result.Value;
+                Console.WriteLine($"Created script-removal patch: {batchResult.PatchPath}");
+                Console.WriteLine($"Removed {batchResult.ScriptsRemoved} script(s) across {batchResult.RecordsModified} record(s):");
+                foreach (var record in batchResult.ModifiedRecords)
+                {
+                    Console.WriteLine($"  - {record}");
+                }
+                if (batchResult.SkippedRecords.Count > 0)
+                {
+                    Console.WriteLine($"Skipped {batchResult.SkippedRecords.Count} record(s):");
+                    foreach (var skipped in batchResult.SkippedRecords)
+                    {
+                        Console.WriteLine($"  - {skipped}");
+                    }
+                }
+            }
+            else
+            {
+                Console.Error.WriteLine($"Error: {result.Error}");
+                if (result.ErrorContext != null)
+                    Console.Error.WriteLine($"Context: {result.ErrorContext}");
+                if (result.Suggestions != null)
+                {
+                    Console.Error.WriteLine("Suggestions:");
+                    foreach (var s in result.Suggestions)
+                        Console.Error.WriteLine($"  - {s}");
+                }
+                Environment.ExitCode = 1;
+            }
+        });
+
+        return cmd;
+    }
+
+    private static Command CreateBatchRenameCommand()
+    {
+        var sourceArg = new Argument<string>("source", "Path to the source plugin");
+        var outputOption = new Option<string>(
+            aliases: new[] { "--output", "-o" },
+            description: "Name of the output patch plugin");
+        var typeOption = new Option<string>("--type", "Record type to filter (currently only 'weapon' is supported)");
+        var editorIdsOption = new Option<string?>("--editor-ids", "Comma-separated list of EditorIDs to rename");
+        var suffixOption = new Option<string>("--append-suffix", "Text appended to the end of each record's existing Name");
+        var dataFolderOption = new Option<string?>("--data-folder", "Data folder path");
+
+        outputOption.IsRequired = true;
+        typeOption.IsRequired = true;
+        suffixOption.IsRequired = true;
+
+        var cmd = new Command("batch-rename", "Create override patches for multiple records, appending a suffix to their display Name")
+        {
+            sourceArg,
+            outputOption,
+            typeOption,
+            editorIdsOption,
+            suffixOption,
+            dataFolderOption
+        };
+
+        cmd.SetHandler((source, output, type, editorIdsStr, suffix, dataFolder, json, verbose) =>
+        {
+            var logger = CreateLogger(json, verbose);
+            var service = new PluginService(logger);
+
+            var editorIds = (editorIdsStr ?? string.Empty)
+                .Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+
+            var result = service.BatchAppendNameSuffix(source, editorIds, type, suffix, output, dataFolder);
+
+            if (json)
+            {
+                Console.WriteLine(result.ToJson(true));
+            }
+            else if (result.Success && result.Value != null)
+            {
+                var batchResult = result.Value;
+                Console.WriteLine($"Created batch rename patch: {batchResult.PatchPath}");
+                Console.WriteLine($"Renamed {batchResult.RecordsModified} record(s):");
+                foreach (var record in batchResult.ModifiedRecords)
+                {
+                    Console.WriteLine($"  - {record}");
+                }
+            }
+            else
+            {
+                Console.Error.WriteLine($"Error: {result.Error}");
+                if (result.ErrorContext != null)
+                    Console.Error.WriteLine($"Context: {result.ErrorContext}");
+                if (result.Suggestions != null)
+                {
+                    Console.Error.WriteLine("Suggestions:");
+                    foreach (var s in result.Suggestions)
+                        Console.Error.WriteLine($"  - {s}");
+                }
+                Environment.ExitCode = 1;
+            }
+        }, sourceArg, outputOption, typeOption, editorIdsOption, suffixOption,
+           dataFolderOption, _jsonOption, _verboseOption);
+
+        return cmd;
+    }
+
     private static Command CreateCompareRecordCommand()
     {
         var plugin1Arg = new Argument<string>("plugin1", "Path to first plugin");
@@ -3749,6 +5335,188 @@ public static class EspCommands
                 Environment.ExitCode = 1;
             }
         }, pluginArg, editorIdArg, dryRunOption, _jsonOption, _verboseOption);
+
+        return cmd;
+    }
+
+    private static bool TryParseTriple(string? s, out float x, out float y, out float z)
+    {
+        x = y = z = 0f;
+        if (string.IsNullOrWhiteSpace(s)) return true;
+        var parts = s.Split(',');
+        if (parts.Length != 3) return false;
+        return float.TryParse(parts[0].Trim(), out x)
+            && float.TryParse(parts[1].Trim(), out y)
+            && float.TryParse(parts[2].Trim(), out z);
+    }
+
+    private static Command CreateOverridePlacedObjectCommand()
+    {
+        var refOption = new Option<string>("--ref", "FormKey of the existing reference to override (e.g. '078039:Skyrim.esm')") { IsRequired = true };
+        var outputOption = new Option<string>(new[] { "-o", "--output" }, "Output patch plugin (appended to if it exists)") { IsRequired = true };
+        var dataFolderOption = new Option<string>("--data-folder", "Data folder containing plugins.txt and the plugins") { IsRequired = true };
+        var baseOption = new Option<string>("--base", "New base object FormKey (optional)");
+        var scaleOption = new Option<string>("--scale", "New scale (optional)");
+        var posOption = new Option<string>("--pos", "New position as x,y,z (optional)");
+        var rotOption = new Option<string>("--rot", "New rotation as x,y,z (optional)");
+        var lightOption = new Option<bool>("--light", "Flag the output plugin as ESL");
+
+        var cmd = new Command("override-placed-object", "Override an existing placed reference in a patch (bakes in the winning version)")
+        {
+            refOption, outputOption, dataFolderOption, baseOption, scaleOption, posOption, rotOption, lightOption
+        };
+
+        cmd.SetHandler((context) =>
+        {
+            var refKey = context.ParseResult.GetValueForOption(refOption)!;
+            var output = context.ParseResult.GetValueForOption(outputOption)!;
+            var dataFolder = context.ParseResult.GetValueForOption(dataFolderOption)!;
+            var baseObj = context.ParseResult.GetValueForOption(baseOption);
+            var scaleStr = context.ParseResult.GetValueForOption(scaleOption);
+            var pos = context.ParseResult.GetValueForOption(posOption);
+            var rot = context.ParseResult.GetValueForOption(rotOption);
+            var light = context.ParseResult.GetValueForOption(lightOption);
+            var json = context.ParseResult.GetValueForOption(_jsonOption);
+            var verbose = context.ParseResult.GetValueForOption(_verboseOption);
+
+            float? scale = null;
+            if (!string.IsNullOrWhiteSpace(scaleStr))
+            {
+                if (!float.TryParse(scaleStr, out var s)) { OutputError("Invalid --scale", json); return; }
+                scale = s;
+            }
+
+            (float, float, float)? posTuple = null;
+            if (!string.IsNullOrWhiteSpace(pos))
+            {
+                if (!TryParseTriple(pos, out var px, out var py, out var pz)) { OutputError("Invalid --pos, expected 'x,y,z'", json); return; }
+                posTuple = (px, py, pz);
+            }
+
+            (float, float, float)? rotTuple = null;
+            if (!string.IsNullOrWhiteSpace(rot))
+            {
+                if (!TryParseTriple(rot, out var rx, out var ry, out var rz)) { OutputError("Invalid --rot, expected 'x,y,z'", json); return; }
+                rotTuple = (rx, ry, rz);
+            }
+
+            var logger = CreateLogger(json, verbose);
+            var service = new PluginService(logger);
+
+            var result = service.OverridePlacedObject(dataFolder, refKey, output, baseObj, scale, posTuple, rotTuple, light);
+
+            if (!result.Success) { OutputError(result.Error!, json, result.Suggestions); return; }
+
+            if (json) Console.WriteLine(new { success = true, result = new { path = result.Value } }.ToJson());
+            else Console.WriteLine($"Overrode {refKey} in: {result.Value}");
+        });
+
+        return cmd;
+    }
+
+    private static Command CreateRemovePlacedObjectCommand()
+    {
+        var pluginArg = new Argument<string>("plugin", "Path to the plugin file to edit");
+        var formIdOption = new Option<string>("--form-id", "FormKey of the placed object to remove") { IsRequired = true };
+
+        var cmd = new Command("remove-placed-object", "Remove a placed object reference from a plugin")
+        {
+            pluginArg, formIdOption
+        };
+
+        cmd.SetHandler((context) =>
+        {
+            var plugin = context.ParseResult.GetValueForArgument(pluginArg);
+            var formId = context.ParseResult.GetValueForOption(formIdOption)!;
+            var json = context.ParseResult.GetValueForOption(_jsonOption);
+            var verbose = context.ParseResult.GetValueForOption(_verboseOption);
+
+            var logger = CreateLogger(json, verbose);
+            var service = new PluginService(logger);
+
+            var result = service.RemovePlacedObject(plugin, formId);
+
+            if (!result.Success) { OutputError(result.Error!, json, result.Suggestions); return; }
+
+            if (json) Console.WriteLine(new { success = true, result = new { path = result.Value } }.ToJson());
+            else Console.WriteLine($"Removed {formId} from: {result.Value}");
+        });
+
+        return cmd;
+    }
+
+    private static Command CreateAddPlacedObjectCommand()
+    {
+        var cellOption = new Option<string>("--cell", "FormKey of the cell to place into (e.g. 'Skyrim.esm:0x0165B5')") { IsRequired = true };
+        var baseOption = new Option<string>("--base", "FormKey of the base object to place (e.g. 'Embers XD.esp:0x18112A')") { IsRequired = true };
+        var outputOption = new Option<string>(new[] { "-o", "--output" }, "Name of the output patch plugin") { IsRequired = true };
+        var dataFolderOption = new Option<string>("--data-folder", "Data folder containing the masters") { IsRequired = true };
+        var posOption = new Option<string>("--pos", "Position as x,y,z") { IsRequired = true };
+        var rotOption = new Option<string>("--rot", "Rotation in degrees as x,y,z (default 0,0,0)");
+        var scaleOption = new Option<float>("--scale", () => 1.0f, "Scale (default 1.0)");
+        var lightOption = new Option<bool>("--light", "Flag the output plugin as ESL (light master)");
+
+        var cmd = new Command("add-placed-object", "Add a new placed object reference into an existing cell")
+        {
+            cellOption, baseOption, outputOption, dataFolderOption, posOption, rotOption, scaleOption, lightOption
+        };
+
+        cmd.SetHandler((context) =>
+        {
+            var cell = context.ParseResult.GetValueForOption(cellOption)!;
+            var baseObj = context.ParseResult.GetValueForOption(baseOption)!;
+            var output = context.ParseResult.GetValueForOption(outputOption)!;
+            var dataFolder = context.ParseResult.GetValueForOption(dataFolderOption)!;
+            var pos = context.ParseResult.GetValueForOption(posOption)!;
+            var rot = context.ParseResult.GetValueForOption(rotOption);
+            var scale = context.ParseResult.GetValueForOption(scaleOption);
+            var light = context.ParseResult.GetValueForOption(lightOption);
+            var json = context.ParseResult.GetValueForOption(_jsonOption);
+            var verbose = context.ParseResult.GetValueForOption(_verboseOption);
+
+            static bool TryParseTriple(string? s, out float x, out float y, out float z)
+            {
+                x = y = z = 0f;
+                if (string.IsNullOrWhiteSpace(s)) return true;
+                var parts = s.Split(',');
+                if (parts.Length != 3) return false;
+                return float.TryParse(parts[0].Trim(), out x)
+                    && float.TryParse(parts[1].Trim(), out y)
+                    && float.TryParse(parts[2].Trim(), out z);
+            }
+
+            if (!TryParseTriple(pos, out var px, out var py, out var pz))
+            {
+                OutputError("Invalid --pos, expected 'x,y,z'", json);
+                return;
+            }
+
+            if (!TryParseTriple(rot, out var rx, out var ry, out var rz))
+            {
+                OutputError("Invalid --rot, expected 'x,y,z'", json);
+                return;
+            }
+
+            var logger = CreateLogger(json, verbose);
+            var service = new PluginService(logger);
+
+            var result = service.AddPlacedObject(dataFolder, cell, baseObj, output, px, py, pz, rx, ry, rz, scale, light);
+
+            if (!result.Success)
+            {
+                OutputError(result.Error!, json, result.Suggestions);
+                return;
+            }
+
+            if (json)
+            {
+                Console.WriteLine(new { success = true, result = new { path = result.Value } }.ToJson());
+            }
+            else
+            {
+                Console.WriteLine($"Added placed object to: {result.Value}");
+            }
+        });
 
         return cmd;
     }

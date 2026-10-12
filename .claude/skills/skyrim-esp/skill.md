@@ -33,6 +33,16 @@ dotnet run --project src/SpookysAutomod.Cli -- esp info "<plugin>"
 dotnet run --project src/SpookysAutomod.Cli -- esp list-masters "<plugin>"
 ```
 
+### Flag or Compact an Existing Plugin as ESL
+
+    dotnet run --project src/SpookysAutomod.Cli -- esp flag-light "<source.esp>" --output "<staging\same-name.esp>" --json
+
+Use flag-light only if all plugin-owned IDs are at most 0xFFF. If they exceed the range, use:
+
+    dotnet run --project src/SpookysAutomod.Cli -- esp compact-light "<source.esp>" --output "<staging\same-name.esp>" --json
+
+The output path must be separate, retain the exact plugin filename, and not already exist. These commands preserve the source. Compaction changes FormIDs; review the mapping and consider saves, scripts, patches, and dependent files before deploying.
+
 ### Add Records
 
 **Books** (work immediately, no model needed):
@@ -199,6 +209,12 @@ dotnet run --project src/SpookysAutomod.Cli -- esp remove-record "<plugin>" "<ed
 ```bash
 dotnet run --project src/SpookysAutomod.Cli -- esp clone-record "<plugin>" "<sourceEditorId>" "<newEditorId>" --dry-run
 ```
+
+**Update a Spell Safely (writes a separate ESL override):**
+```bash
+dotnet run --project src/SpookysAutomod.Cli -- esp update-spell "<source>" --output "esp-workspace/output/<new-patch.esp>" --editor-id "<spellEditorId>" --type spell --equipment-type "013F44:Skyrim.esm"
+```
+Use either or both of `--type` and `--equipment-type`. The source remains unchanged, and the output path must not already exist.
 
 ### Quest Aliases
 Quest aliases enable dynamic tracking of NPCs, objects, or locations. Essential for follower frameworks.

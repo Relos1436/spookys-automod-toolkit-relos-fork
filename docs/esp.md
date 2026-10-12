@@ -67,6 +67,26 @@ esp info "MyMod.esp"
 
 ---
 
+### flag-light
+
+Set the ESL flag on an existing .esp without rewriting its records.
+
+    esp flag-light <plugin> --output <staging-path-with-same-filename>
+
+This command checks plugin-owned local FormIDs and refuses any ID above 0xFFF. Use it only when the plugin already fits the ESL range. It preserves the source and verifies the staged output.
+
+### compact-light
+
+Remap plugin-owned records into the ESL local FormID range, remap internal links, and set the ESL flag.
+
+    esp compact-light <plugin> --output <staging-path-with-same-filename>
+
+The output must use the source filename, go to a different path, and not already exist. The source is never overwritten. The command reports the old-to-new FormID map and reopens the output to verify the ESL flag, record identities, internal links, and local ID range.
+
+**Compatibility warning:** compaction changes plugin-owned FormIDs. Existing saves, Papyrus scripts, patches, and other files that store those IDs may need updates. Inspect the map and dependent files before deployment. If no owned IDs exceed 0xFFF, compaction is unnecessary; use flag-light if only the header flag is needed.
+
+---
+
 ### add-quest
 
 Add a quest record to a plugin.
@@ -213,11 +233,17 @@ esp add-weapon <plugin> <editorId> [options]
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--name` | - | Display name |
+| `--description` | - | Item card description text. See note below - some UI mods crash without this set. |
 | `--type` | `sword` | Type (see below) |
 | `--damage` | 10 | Base damage |
 | `--value` | 100 | Gold value |
 | `--weight` | 5 | Weight |
 | `--model` | - | Model path or preset |
+| `--speed` | - | Attack speed multiplier (vanilla weapons are typically 0.8-1.3) |
+| `--reach` | - | Attack reach multiplier (vanilla weapons are typically 0.7-1.5) |
+| `--critical-damage` | - | Bonus damage applied on a critical hit |
+| `--keyword` | - | Add a keyword, format `FormId:ModName.esp` (no `0x` prefix) or EditorID (can use multiple times) |
+| `--bounds` | small non-zero default | Object bounds as `minX,minY,minZ,maxX,maxY,maxZ` (game units). A small non-zero default is applied automatically - only set this if you know the real mesh dimensions. |
 
 **Weapon Types:**
 - `sword` - One-handed sword
@@ -239,6 +265,23 @@ esp add-weapon <plugin> <editorId> [options]
 
 **Important:** Without `--model`, the weapon will be invisible in-game.
 
+**Important:** Always set `--description` for any weapon the player will see in their inventory
+(not a purely internal/never-picked-up marker). At least one installed UI mod
+(DescriptionFramework) has been confirmed to crash to desktop while building the item card for
+a weapon with no description text set - the crash happened while a custom weapon with an empty
+description was open in the inventory menu, traced via a real crash log back to
+`ItemCardFixer::applyDescription`. A one-line flavor description is enough to avoid it.
+
+**Equip-safety defaults:** a weapon record created here (via Mutagen's `AddNew()`, never touched
+by the Creation Kit) is automatically given non-null `EquipmentType`, `BlockBashImpact`,
+`AlternateBlockMaterial`, `ImpactDataSet`, `AttackFailSound`, `EquipSound`, `UnequipSound`,
+`DetectionSoundLevel`, and (once `--model` is set) a matching `FirstPersonModel`. This was added
+after a real, reproducible crash: a weapon with a null `FirstPersonModel` crashed the game the
+moment it was equipped and viewed in the inventory. The defaults are copied from a verified
+working one-handed dagger-type weapon - a reasonable baseline for any weapon type, not
+necessarily precise for e.g. a bow or staff. Use `WithFirstPersonModel()` (builder) to point at
+a different mesh or an existing Static if the auto-created one isn't right.
+
 **Examples:**
 ```bash
 # Sword with vanilla iron sword model
@@ -249,6 +292,12 @@ esp add-weapon "MyMod.esp" "MyMod_DaedricBlade" --name "Daedric Blade" --type sw
 
 # Bow
 esp add-weapon "MyMod.esp" "MyMod_Bow" --name "Hunter's Bow" --type bow --damage 15 --model hunting-bow
+
+# Non-combat prop weapon (e.g. a physical VR tool) matching an existing vanilla weapon's feel,
+# with real WeapTypeDagger/WeapMaterialIron classification keywords
+esp add-weapon "MyMod.esp" "MyMod_Tool" --name "My Tool" --type dagger --damage 0 --value 10 \
+  --weight 0 --model "meshes\myTool.nif" --speed 1.3 --reach 0.7 --critical-damage 2 \
+  --keyword "01E713:Skyrim.esm" --keyword "01E718:Skyrim.esm"
 ```
 
 ---
@@ -412,6 +461,43 @@ esp add-leveled-item "MyMod.esp" "MyMod_QuestReward" --chance-none 0 --use-all -
 
 ---
 
+### add-keyword
+
+Add a Keyword (KYWD) record to a plugin.
+
+Keywords are minimal records whose value is as a stable tag other systems can match on. The main use is with a runtime patcher such as SkyPatcher: define a keyword here, then have SkyPatcher attach it onto records your plugin does not own, letting you classify third-party items without editing or overriding them.
+
+```bash
+esp add-keyword <plugin> <editorId> [options]
+```
+
+**Arguments:**
+| Argument | Description |
+|----------|-------------|
+| `plugin` | Path to the plugin file |
+| `editorId` | Unique Editor ID for the keyword |
+
+**Options:**
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--dry-run` | false | Preview changes without saving |
+
+Fails if a keyword with that EditorID already exists in the plugin, since a patcher matching by EditorID would otherwise bind to an arbitrary one of the duplicates.
+
+**Example:**
+```bash
+esp add-keyword "MyMod.esp" "MyMod_RestoreHealth"
+```
+
+Then, in a SkyPatcher config, tag every ingestible using Skyrim's RestoreHealth effect:
+```
+filterByMgefs=Skyrim.esm|0003EB15:keywordsToAdd=MyMod_RestoreHealth
+```
+
+**Implementation note:** unlike most Mutagen groups, `SkyrimGroup<Keyword>` exposes no `AddNew()` - the record is constructed against the mod (which assigns the FormKey) and then added to the group. `Keyword.Color` is a `System.Drawing.Color?`, not a uint.
+
+---
+
 ### add-form-list
 
 Add a form list to a plugin for script property collections.
@@ -435,7 +521,7 @@ esp add-form-list <plugin> <editorId> [options]
 **Examples:**
 ```bash
 # Add vanilla forms by FormKey
-esp add-form-list "MyMod.esp" "MyMod_MetalKeywords" --add-form "Skyrim.esm:0x000896" --add-form "Skyrim.esm:0x000897"
+esp add-form-list "MyMod.esp" "MyMod_MetalKeywords" --add-form "000896:Skyrim.esm" --add-form "000897:Skyrim.esm"
 
 # Add mod-specific forms by EditorID
 esp add-form-list "MyMod.esp" "MyMod_CustomWeapons" --add-form "MyMod_Sword01" --add-form "MyMod_Sword02"
@@ -1013,6 +1099,25 @@ esp view-record "MyMod.esp" --editor-id "MyQuest" --type quest --json
 
 ---
 
+### update-spell
+
+Create an ESL override patch that changes selected fields on an existing spell. The source plugin is read-only; output must be a new `.esp` or `.esl` path, and an existing output file is never overwritten. Unspecified fields, effects, and scripts are preserved.
+
+```bash
+esp update-spell <source> --output <new-patch.esp> --editor-id <editorId> [--type spell|power|lesser-power|ability] [--equipment-type <FORMID:MODNAME>]
+```
+
+At least one of `--type` or `--equipment-type` is required. Equipment type uses a FormKey such as `013F44:Skyrim.esm`.
+
+```bash
+# Convert a VRIK-style calibration power into a normal hand-equipped spell
+esp update-spell "VRIK.esp" --output "esp-workspace/output/VRIKSpellPatch.esp" --editor-id "_vrik_spel_calibrate" --type spell --equipment-type "013F44:Skyrim.esm"
+```
+
+The patch includes the source plugin and its listed masters and must load after them.
+
+---
+
 ### create-override
 
 Create an override patch for a record from another plugin.
@@ -1157,6 +1262,40 @@ esp batch-override "MyMod.esp" -o "Globals_Patch.esp" --type global
   }
 }
 ```
+
+---
+
+### batch-rename
+
+Create override patches for multiple records, appending a suffix to their display Name. Currently only `weapon` records are supported.
+
+```bash
+esp batch-rename <source> --output <output> --type weapon --editor-ids <ids> --append-suffix <suffix> [options]
+```
+
+**Arguments:**
+| Argument | Description |
+|----------|-------------|
+| `source` | Path to the source plugin |
+
+**Options:**
+| Option | Required | Description |
+|--------|----------|-------------|
+| `--output`, `-o` | Yes | Name of the output patch plugin |
+| `--type` | Yes | Record type to filter (only `weapon` supported) |
+| `--append-suffix` | Yes | Text appended to the end of each record's existing Name |
+| `--editor-ids` | No | Comma-separated list of EditorIDs to rename |
+| `--data-folder` | No | Data folder path |
+
+**Example:**
+```bash
+# Fix enchanted weapon names missing a "(Reversed)" suffix
+esp batch-rename "ReversedDaggers VR.esp" -o "NameFix.esp" --type weapon \
+  --editor-ids "ReverseEnchIronDaggerFire01,ReverseEnchIronDaggerFire02" \
+  --append-suffix " (Reversed)"
+```
+
+EditorIDs not found, or not weapons, are skipped and logged rather than failing the whole batch.
 
 ---
 

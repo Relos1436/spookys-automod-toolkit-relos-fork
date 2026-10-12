@@ -5,6 +5,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Mutagen.Bethesda.Fallout4" Version="0.52.0" />
     <PackageReference Include="Mutagen.Bethesda.Skyrim" Version="0.52.0" />
   </ItemGroup>
 

@@ -9,6 +9,7 @@ namespace SpookysAutomod.Core.Models;
 public class Result<T>
 {
     [JsonPropertyName("success")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.Never)]
     public bool Success { get; init; }
 
     [JsonPropertyName("result")]

@@ -22,6 +22,8 @@ public static class McmCommands
         mcmCommand.AddCommand(CreateValidateCommand());
         mcmCommand.AddCommand(CreateAddToggleCommand());
         mcmCommand.AddCommand(CreateAddSliderCommand());
+        mcmCommand.AddCommand(CreateGenerateSettingsCommand());
+        mcmCommand.AddCommand(CreateAddQuestCommand());
 
         return mcmCommand;
     }
@@ -341,6 +343,154 @@ public static class McmCommands
                 Environment.ExitCode = 1;
             }
         }, configArg, idArg, textArg, minOption, maxOption, stepOption, _jsonOption, _verboseOption);
+
+        return cmd;
+    }
+
+    /// <summary>
+    /// settings.ini is mandatory for ModSetting-backed menus - see McmService.GenerateSettingsIni.
+    /// </summary>
+    private static Command CreateGenerateSettingsCommand()
+    {
+        var configArg = new Argument<string>("config", "Path to the MCM config.json");
+        var outputOption = new Option<string?>(
+            aliases: new[] { "--output", "-o" },
+            description: "Output path for settings.ini (defaults to alongside config.json, which is where MCM Helper expects it)");
+
+        var cmd = new Command("generate-settings", "Generate the REQUIRED settings.ini defaults file next to config.json")
+        {
+            configArg,
+            outputOption
+        };
+
+        cmd.SetHandler((config, output, json, verbose) =>
+        {
+            var logger = CreateLogger(json, verbose);
+            var service = new McmService(logger);
+
+            var result = service.GenerateSettingsIni(config, output);
+            if (!result.Success)
+            {
+                OutputError(result.Error!, json);
+                return;
+            }
+
+            if (json)
+            {
+                Console.WriteLine(new { success = true, result = new { settingsFile = result.Value } }.ToJson());
+            }
+            else
+            {
+                Console.WriteLine($"Generated settings.ini: {result.Value}");
+            }
+        }, configArg, outputOption, _jsonOption, _verboseOption);
+
+        return cmd;
+    }
+
+    /// <summary>
+    /// Creates the plugin-side half of an MCM menu. A config.json on its own NEVER produces a
+    /// menu: MCM Helper populates the MCM list from quests running its MCM_ConfigBase script,
+    /// so the mod's plugin must contain one. Mirrors the structure of known-working config-only
+    /// MCM mods (e.g. FasterLoadscreens.esp).
+    /// </summary>
+    private static Command CreateAddQuestCommand()
+    {
+        var pluginArg = new Argument<string>("plugin", "Path to the plugin file (.esp/.esl)");
+        var modNameOption = new Option<string>("--mod-name", "MCM modName - MUST match the MCM/Config/<modName> folder and the config.json modName") { IsRequired = true };
+        var editorIdOption = new Option<string?>("--editor-id", "Editor ID for the quest (default: <modName>_ConfigMenuQuest)");
+        var noAliasOption = new Option<bool>("--no-player-alias", "Skip the player alias. The alias runs SkyUI's SKI_PlayerLoadGameAlias so the menu re-registers on every load; omit it only if you specifically don't want that.");
+        var seqOption = new Option<string?>("--seq-output", "Also write the SEQ file to this directory. Required for the start-game-enabled quest to start in an ALREADY-RUNNING save.");
+
+        var cmd = new Command("add-quest", "Add the MCM_ConfigBase quest a plugin needs for its MCM menu to appear")
+        {
+            pluginArg, modNameOption, editorIdOption, noAliasOption, seqOption
+        };
+
+        cmd.SetHandler((context) =>
+        {
+            var plugin = context.ParseResult.GetValueForArgument(pluginArg);
+            var modName = context.ParseResult.GetValueForOption(modNameOption)!;
+            var editorId = context.ParseResult.GetValueForOption(editorIdOption) ?? $"{modName}_ConfigMenuQuest";
+            var noAlias = context.ParseResult.GetValueForOption(noAliasOption);
+            var seqOutput = context.ParseResult.GetValueForOption(seqOption);
+            var json = context.ParseResult.GetValueForOption(_jsonOption);
+            var verbose = context.ParseResult.GetValueForOption(_verboseOption);
+
+            var logger = CreateLogger(json, verbose);
+            var service = new SpookysAutomod.Esp.Services.PluginService(logger);
+
+            var loadResult = service.LoadPluginForEdit(plugin);
+            if (!loadResult.Success) { OutputError(loadResult.Error!, json); return; }
+            var mod = loadResult.Value!;
+
+            if (mod.Quests.Any(q => q.EditorID == editorId))
+            {
+                OutputError($"Quest already exists: {editorId}", json);
+                return;
+            }
+
+            // Start-game-enabled + run-once, priority 0 - matches shipped config-only MCM mods.
+            var quest = new SpookysAutomod.Esp.Builders.QuestBuilder(mod, editorId)
+                .WithName(modName)
+                .StartEnabled()
+                .RunOnce()
+                .WithPriority(0)
+                .Build();
+
+            // Attach MCM Helper's own script - this is what puts the mod in the MCM list.
+            var adapter = quest.VirtualMachineAdapter as Mutagen.Bethesda.Skyrim.QuestAdapter ?? new Mutagen.Bethesda.Skyrim.QuestAdapter();
+            var scriptEntry = new Mutagen.Bethesda.Skyrim.ScriptEntry
+            {
+                Name = "MCM_ConfigBase",
+                Flags = Mutagen.Bethesda.Skyrim.ScriptEntry.Flag.Local
+            };
+            adapter.Scripts.Add(scriptEntry);
+            quest.VirtualMachineAdapter = adapter;
+
+            // MCM Helper matches this property against the MCM/Config/<modName> folder.
+            var propService = new SpookysAutomod.Esp.Services.ScriptPropertyService(logger);
+            if (!propService.SetStringProperty(scriptEntry, "ModName", modName))
+            {
+                OutputError($"Failed to set the ModName property on MCM_ConfigBase.", json);
+                return;
+            }
+
+            if (!noAlias)
+            {
+                // Forced-referenced to the player so the alias always fills - an alias with no
+                // fill method can stop the quest from starting entirely.
+                var aliasResult = service.AddAliasToQuest(quest, "PlayerAlias", "SKI_PlayerLoadGameAlias", null, "000014:Skyrim.esm");
+                if (!aliasResult.Success) { OutputError(aliasResult.Error!, json); return; }
+            }
+
+            var saveResult = service.SavePlugin(mod, plugin);
+            if (!saveResult.Success) { OutputError(saveResult.Error!, json); return; }
+
+            string? seqPath = null;
+            if (!string.IsNullOrWhiteSpace(seqOutput))
+            {
+                var seqResult = service.GenerateSeqFile(plugin, seqOutput);
+                if (!seqResult.Success) { OutputError(seqResult.Error!, json); return; }
+                seqPath = seqResult.Value;
+            }
+
+            if (json)
+            {
+                Console.WriteLine(new
+                {
+                    success = true,
+                    result = new { plugin, quest = editorId, modName, playerAlias = !noAlias, seqFile = seqPath }
+                }.ToJson());
+            }
+            else
+            {
+                Console.WriteLine($"Added MCM quest '{editorId}' (ModName='{modName}') to {plugin}");
+                if (!noAlias) Console.WriteLine("  + PlayerAlias forced to the player, running SKI_PlayerLoadGameAlias");
+                if (seqPath != null) Console.WriteLine($"  + SEQ file: {seqPath}");
+                Console.WriteLine($"  Reminder: MCM/Config/{modName}/ needs BOTH config.json and settings.ini (see 'mcm generate-settings').");
+            }
+        });
 
         return cmd;
     }

@@ -135,7 +135,7 @@ Generated config.json structure:
   "minMcmVersion": 7,
   "pages": [
     {
-      "pageDisplayName": "Main",
+      "pageDisplayName": "General",
       "content": [
         {
           "type": "toggle",
@@ -155,6 +155,8 @@ Generated config.json structure:
   ]
 }
 ```
+
+> **Gotcha:** never name a page `"Main"`. Confirmed 2026-09-09 on MCM Helper v1.6.1.0 (Skyrim VR) — a page literally named `"Main"` renders completely blank in-game (no controls, no errors in MCMHelper.log), even with a valid header as the first content item. Every other page name works fine. Use `"General"` (the convention above) or any other name instead.
 
 ### Control Types
 

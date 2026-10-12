@@ -12,6 +12,10 @@
 
 ## Overview
 
+**Local Fallout 4 extension:** use `spookys-automod fo4` to inspect Fallout 4 plugins, create records, and write override patches. See [Fallout 4 commands and limitations](docs/fallout4.md). The `esp` command group remains Skyrim-specific.
+
+**Fallout DLL development:** use `spookys-automod f4se` to create and build C++ plugin starters for Fallout 4 VR 1.2.72 or legacy desktop 1.10.163. See [DLL setup, SDK paths and validation limits](docs/f4se.md).
+
 A command-line toolkit that enables AI assistants (Claude, ChatGPT, etc.) to create and modify Skyrim mods programmatically. Simply describe what you want and let the AI handle the technical work.
 
 ```
@@ -403,6 +407,15 @@ nif list-textures "Meshes/Armor/CustomArmor.nif"
 mcm info "MCM/Config/SomeMod/config.json"
 ```
 
+### Flag or Compact an ESP as ESL
+
+esp flag-light only sets the header flag and succeeds when all plugin-owned local FormIDs fit 0x000-0xFFF. If they do not, stage a remapped copy with esp compact-light; it remaps owned IDs and internal links, then verifies the output. The source is never overwritten, and output must retain the plugin filename.
+
+    dotnet run --project src/SpookysAutomod.Cli -- esp flag-light "path/to/MyMod.esp" --output "staging/MyMod.esp" --json
+    dotnet run --project src/SpookysAutomod.Cli -- esp compact-light "path/to/MyMod.esp" --output "staging/MyMod.esp" --json
+
+Compaction changes plugin-owned FormIDs. Existing saves, scripts, patches, and other files that store those IDs may need updates. Review the emitted old-to-new map and verify dependent files before deployment.
+
 ### Extract and Decompile
 
 ```bash
@@ -613,6 +626,7 @@ esp list-masters "Mod.esp"
 esp view-record "Mod.esp" --editor-id "RecordID" --type spell --json
 esp view-record "Mod.esp" --form-id "000802:Mod.esp" --json
 esp create-override "Source.esp" -o "Patch.esp" --editor-id "RecordID" --type weapon
+esp update-spell "Source.esp" -o "esp-workspace/output/SpellPatch.esp" --editor-id "SpellID" --type spell --equipment-type "013F44:Skyrim.esm"
 esp find-record --search "Iron" --type weapon --plugin "Skyrim.esm"
 esp batch-override "Source.esp" -o "Patch.esp" --search "Fire*" --type spell
 esp compare-record "Mod1.esp" "Mod2.esp" --editor-id "RecordID" --type armor

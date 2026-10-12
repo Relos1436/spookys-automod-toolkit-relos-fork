@@ -16,6 +16,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\..\src\SpookysAutomod.Skse\SpookysAutomod.Skse.csproj" />
     <ProjectReference Include="..\..\src\SpookysAutomod.Core\SpookysAutomod.Core.csproj" />
     <ProjectReference Include="..\..\src\SpookysAutomod.Esp\SpookysAutomod.Esp.csproj" />
     <ProjectReference Include="..\..\src\SpookysAutomod.Archive\SpookysAutomod.Archive.csproj" />

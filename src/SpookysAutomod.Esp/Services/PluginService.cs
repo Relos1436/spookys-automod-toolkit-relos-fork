@@ -1,5 +1,7 @@
 using Mutagen.Bethesda;
 using Mutagen.Bethesda.Plugins;
+using Mutagen.Bethesda.Plugins.Cache;
+using Mutagen.Bethesda.Plugins.Order;
 using Mutagen.Bethesda.Plugins.Records;
 using Mutagen.Bethesda.Skyrim;
 using Noggog;
@@ -1344,12 +1346,17 @@ public class PluginService
                 case "encounterzone":
                     found = mod.EncounterZones.FirstOrDefault(e => e.EditorID?.Equals(editorId, StringComparison.OrdinalIgnoreCase) == true);
                     break;
+                case "constructibleobject":
+                case "cobj":
+                case "recipe":
+                    found = mod.ConstructibleObjects.FirstOrDefault(c => c.EditorID?.Equals(editorId, StringComparison.OrdinalIgnoreCase) == true);
+                    break;
                 default:
                     return Result<IMajorRecordGetter>.Fail(
                         $"Unsupported record type: {recordType}",
                         suggestions: new List<string>
                         {
-                            "Supported types: spell, weapon, armor, quest, npc, perk, faction, book, miscitem, global, leveleditem, formlist, outfit, location, encounterzone",
+                            "Supported types: spell, weapon, armor, quest, npc, perk, faction, book, miscitem, global, leveleditem, formlist, outfit, location, encounterzone, constructibleobject",
                             "Use --form-id instead for other record types"
                         });
             }
@@ -1389,6 +1396,8 @@ public class PluginService
                 IQuestGetter quest => ExtractQuestProperties(quest),
                 INpcGetter npc => ExtractNpcProperties(npc),
                 IPerkGetter perk => ExtractPerkProperties(perk),
+                IPlacedObjectGetter placed => ExtractPlacedObjectProperties(placed),
+                IConstructibleObjectGetter cobj => ExtractConstructibleObjectProperties(cobj),
                 _ => includeRaw ? ExtractPropertiesViaReflection(record) : Result<Dictionary<string, object?>>.Ok(new Dictionary<string, object?>())
             };
         }
@@ -1490,6 +1499,36 @@ public class PluginService
     }
 
     /// <summary>
+    /// Extract crafting-recipe (ConstructibleObject) properties: what it makes, at which
+    /// workbench, and what ingredients it consumes.
+    /// </summary>
+    private Result<Dictionary<string, object?>> ExtractConstructibleObjectProperties(IConstructibleObjectGetter cobj)
+    {
+        var props = new Dictionary<string, object?>
+        {
+            ["CreatedObject"] = cobj.CreatedObject.IsNull ? null : cobj.CreatedObject.FormKey.ToString(),
+            ["CreatedObjectCount"] = cobj.CreatedObjectCount,
+            ["WorkbenchKeyword"] = (cobj.WorkbenchKeyword == null || cobj.WorkbenchKeyword.IsNull) ? null : cobj.WorkbenchKeyword.FormKey.ToString()
+        };
+
+        var items = new List<Dictionary<string, object?>>();
+        if (cobj.Items != null)
+        {
+            foreach (var entry in cobj.Items)
+            {
+                items.Add(new Dictionary<string, object?>
+                {
+                    ["Item"] = entry.Item.Item.FormKey.ToString(),
+                    ["Count"] = entry.Item.Count
+                });
+            }
+        }
+        props["Items"] = items;
+
+        return Result<Dictionary<string, object?>>.Ok(props);
+    }
+
+    /// <summary>
     /// Extract quest-specific properties
     /// </summary>
     private Result<Dictionary<string, object?>> ExtractQuestProperties(IQuestGetter quest)
@@ -1551,6 +1590,32 @@ public class PluginService
             ["Description"] = perk.Description?.String,
             ["EffectCount"] = perk.Effects.Count
         };
+
+        return Result<Dictionary<string, object?>>.Ok(props);
+    }
+
+    /// <summary>
+    /// Extract properties for a placed object reference (base object + transform).
+    /// Placement is a nested record, so plain reflection only reports the type name -
+    /// this flattens position/rotation into readable values.
+    /// </summary>
+    private Result<Dictionary<string, object?>> ExtractPlacedObjectProperties(IPlacedObjectGetter placed)
+    {
+        var props = new Dictionary<string, object?>
+        {
+            ["base"] = placed.Base.FormKey.ToString(),
+            ["scale"] = placed.Scale ?? 1.0f
+        };
+
+        if (placed.Placement is { } placement)
+        {
+            props["posX"] = placement.Position.X;
+            props["posY"] = placement.Position.Y;
+            props["posZ"] = placement.Position.Z;
+            props["rotX"] = placement.Rotation.X;
+            props["rotY"] = placement.Rotation.Y;
+            props["rotZ"] = placement.Rotation.Z;
+        }
 
         return Result<Dictionary<string, object?>>.Ok(props);
     }
@@ -1777,6 +1842,563 @@ public class PluginService
     }
 
     /// <summary>
+    /// Create an ESL override patch that updates selected fields on an existing spell.
+    /// The source plugin is loaded read-only and is never modified.
+    /// </summary>
+    public Result<string> UpdateSpell(
+        string sourcePluginPath,
+        string outputPluginPath,
+        string editorId,
+        SpellType? spellType = null,
+        string? equipmentTypeFormKey = null)
+    {
+        try
+        {
+            if (!File.Exists(sourcePluginPath))
+                return Result<string>.Fail($"Source plugin not found: {sourcePluginPath}");
+
+            if (spellType == null && string.IsNullOrWhiteSpace(equipmentTypeFormKey))
+                return Result<string>.Fail("Specify at least one spell field to update: type or equipment type.");
+
+            var sourcePath = Path.GetFullPath(sourcePluginPath);
+            var outputPath = Path.GetFullPath(outputPluginPath);
+            if (string.Equals(sourcePath, outputPath, StringComparison.OrdinalIgnoreCase))
+                return Result<string>.Fail("Output path must differ from the source plugin path.");
+
+            if (!outputPath.EndsWith(".esp", StringComparison.OrdinalIgnoreCase) &&
+                !outputPath.EndsWith(".esl", StringComparison.OrdinalIgnoreCase))
+                return Result<string>.Fail("Output path must end in .esp or .esl.");
+
+            if (File.Exists(outputPath))
+                return Result<string>.Fail($"Output file already exists: {outputPath}",
+                    suggestions: new List<string> { "Choose a new output path; existing files are never overwritten." });
+
+            if (!string.IsNullOrWhiteSpace(equipmentTypeFormKey) &&
+                !FormKey.TryFactory(equipmentTypeFormKey, out _))
+                return Result<string>.Fail(
+                    $"Invalid equipment type FormKey: '{equipmentTypeFormKey}'. Expected 'FORMID:MODNAME', for example '013F44:Skyrim.esm'.");
+
+            var sourceMod = SkyrimMod.CreateFromBinaryOverlay(sourcePath, SkyrimRelease.SkyrimSE);
+            var sourceSpell = sourceMod.Spells.FirstOrDefault(spell =>
+                string.Equals(spell.EditorID, editorId, StringComparison.OrdinalIgnoreCase));
+            if (sourceSpell == null)
+                return Result<string>.Fail($"Spell not found in source plugin: {editorId}",
+                    suggestions: new List<string> { "Use 'esp list-records <source> --type spell' to find its EditorID." });
+
+            var patchName = Path.GetFileName(outputPath);
+            var patchMod = new SkyrimMod(ModKey.FromFileName(patchName), SkyrimRelease.SkyrimSE);
+            patchMod.ModHeader.Flags |= SkyrimModHeader.HeaderFlag.Small;
+
+            // Preserve the source's master chain, then add the source itself.
+            foreach (var master in sourceMod.ModHeader.MasterReferences)
+            {
+                if (!patchMod.ModHeader.MasterReferences.Any(existing => existing.Master == master.Master))
+                    patchMod.ModHeader.MasterReferences.Add(new MasterReference { Master = master.Master });
+            }
+            if (!patchMod.ModHeader.MasterReferences.Any(master => master.Master == sourceMod.ModKey))
+                patchMod.ModHeader.MasterReferences.Add(new MasterReference { Master = sourceMod.ModKey });
+
+            var spellOverride = (Spell)sourceSpell.DeepCopy();
+            if (spellType.HasValue)
+                spellOverride.Type = spellType.Value;
+            if (!string.IsNullOrWhiteSpace(equipmentTypeFormKey))
+            {
+                FormKey.TryFactory(equipmentTypeFormKey, out var equipmentTypeKey);
+                spellOverride.EquipmentType.SetTo(equipmentTypeKey);
+            }
+            patchMod.Spells.Add(spellOverride);
+
+            var outputDirectory = Path.GetDirectoryName(outputPath);
+            if (!string.IsNullOrEmpty(outputDirectory))
+                Directory.CreateDirectory(outputDirectory);
+            patchMod.WriteToBinary(outputPath);
+
+            _logger.Info($"Created ESL spell override patch: {outputPath}");
+            return Result<string>.Ok(outputPath);
+        }
+        catch (Exception ex)
+        {
+            return Result<string>.Fail($"Failed to update spell: {ex.Message}", ex.StackTrace);
+        }
+    }
+
+    /// <summary>
+    /// Add starting stock to an EXISTING container record (by EditorID) already in this plugin.
+    /// Simple direct edit, no override machinery - same shape as AddPlacedObjectToLocalCell.
+    /// </summary>
+    /// <summary>
+    /// Removes every item entry from a container in THIS SAME plugin, so it can be re-seeded
+    /// cleanly via AddItemToLocalContainer. Needed because there is no per-entry remove - a
+    /// container's starting stock is only ever additive otherwise, which is a problem the moment
+    /// a previous add was wrong (bad FormKey, duplicate) or the container already had stock from
+    /// an earlier build and a fresh add would double it rather than replace it.
+    /// </summary>
+    public Result<string> ClearLocalContainerItems(SkyrimMod mod, string containerEditorId)
+    {
+        try
+        {
+            var container = mod.Containers.FirstOrDefault(c => c.EditorID == containerEditorId);
+            if (container == null)
+            {
+                return Result<string>.Fail($"Container not found in this plugin: {containerEditorId}");
+            }
+
+            var removedCount = container.Items?.Count ?? 0;
+            container.Items = new Noggog.ExtendedList<ContainerEntry>();
+
+            return Result<string>.Ok($"{containerEditorId} ({removedCount} entries removed)");
+        }
+        catch (Exception ex)
+        {
+            return Result<string>.Fail($"Failed to clear local container items: {ex.Message}", ex.StackTrace);
+        }
+    }
+
+    public Result<string> AddItemToLocalContainer(SkyrimMod mod, string containerEditorId, FormKey itemKey, int count)
+    {
+        try
+        {
+            var container = mod.Containers.FirstOrDefault(c => c.EditorID == containerEditorId);
+            if (container == null)
+            {
+                return Result<string>.Fail($"Container not found in this plugin: {containerEditorId}");
+            }
+
+            container.Items ??= new Noggog.ExtendedList<ContainerEntry>();
+            container.Items.Add(new ContainerEntry
+            {
+                Item = new ContainerItem
+                {
+                    Item = itemKey.ToLink<IItemGetter>(),
+                    Count = count,
+                },
+            });
+
+            if (itemKey.ModKey != mod.ModKey &&
+                !mod.ModHeader.MasterReferences.Any(m => m.Master == itemKey.ModKey))
+            {
+                mod.ModHeader.MasterReferences.Add(new MasterReference { Master = itemKey.ModKey });
+            }
+
+            return Result<string>.Ok(containerEditorId);
+        }
+        catch (Exception ex)
+        {
+            return Result<string>.Fail($"Failed to add item to local container: {ex.Message}", ex.StackTrace);
+        }
+    }
+
+    /// <summary>
+    /// Add a PlacedObject reference into a cell that already exists IN THE SAME in-memory mod
+    /// being edited (e.g. a cell this plugin itself created earlier in the same session). Unlike
+    /// AddPlacedObject below, this needs no plugins.txt/load-order/override-patch machinery at
+    /// all - it's a plain same-file load-modify-save, the same shape as every other single-file
+    /// command in this class. Also avoids a real bug in AddPlacedObject's approach: building a
+    /// load-order there requires listing the OUTPUT plugin itself in plugins.txt (since the
+    /// target cell lives in it), which opens that exact output path via
+    /// CreateFromBinaryOverlay - a lazy/memory-mapped reader that keeps the file open - and then
+    /// immediately fails writing back to that same still-open path. This method sidesteps the
+    /// whole class of bug by never needing an overlay-based load order in the first place.
+    /// </summary>
+    public Result<string> AddPlacedObjectToLocalCell(
+        SkyrimMod mod,
+        string cellEditorId,
+        FormKey baseObjectKey,
+        float posX, float posY, float posZ,
+        float rotX, float rotY, float rotZ,
+        float scale = 1.0f)
+    {
+        try
+        {
+            Cell? targetCell = null;
+            foreach (var block in mod.Cells)
+            {
+                foreach (var subBlock in block.SubBlocks)
+                {
+                    targetCell = subBlock.Cells.FirstOrDefault(c => c.EditorID == cellEditorId);
+                    if (targetCell != null) break;
+                }
+                if (targetCell != null) break;
+            }
+
+            if (targetCell == null)
+            {
+                return Result<string>.Fail(
+                    $"Cell not found in this plugin: {cellEditorId}",
+                    suggestions: new List<string> { "Verify the cell editor ID and that it was created in this same plugin (use 'esp create-cell')" });
+            }
+
+            var newRef = new PlacedObject(mod.GetNextFormKey(), SkyrimRelease.SkyrimSE);
+            newRef.Base.SetTo(baseObjectKey);
+            newRef.Placement = new Placement
+            {
+                Position = new P3Float(posX, posY, posZ),
+                Rotation = new P3Float(rotX, rotY, rotZ)
+            };
+            newRef.Scale = scale;
+
+            targetCell.Temporary.Add(newRef);
+
+            if (baseObjectKey.ModKey != mod.ModKey &&
+                !mod.ModHeader.MasterReferences.Any(m => m.Master == baseObjectKey.ModKey))
+            {
+                mod.ModHeader.MasterReferences.Add(new MasterReference { Master = baseObjectKey.ModKey });
+            }
+
+            return Result<string>.Ok(newRef.FormKey.ToString());
+        }
+        catch (Exception ex)
+        {
+            return Result<string>.Fail($"Failed to add placed object to local cell: {ex.Message}", ex.StackTrace);
+        }
+    }
+
+    /// <summary>
+    /// Add a brand new PlacedObject reference into an existing cell (owned by another
+    /// master plugin, e.g. Skyrim.esm), without duplicating that cell's existing
+    /// Temporary/Persistent reference lists. Uses a minimal cell override via
+    /// ResolveContext/GetOrAddAsOverride so only the new reference is added - every
+    /// other object already in the cell is left completely untouched.
+    /// </summary>
+    public Result<string> AddPlacedObject(
+        string dataFolder,
+        string cellFormKey,
+        string baseObjectFormKey,
+        string outputPluginName,
+        float posX, float posY, float posZ,
+        float rotX, float rotY, float rotZ,
+        float scale = 1.0f,
+        bool light = false)
+    {
+        try
+        {
+            if (!Mutagen.Bethesda.Plugins.FormKey.TryFactory(cellFormKey, out var cellKey))
+            {
+                return Result<string>.Fail(
+                    $"Invalid cell FormKey format: {cellFormKey}",
+                    suggestions: new List<string> { "Use format: PluginName.esp:0x000800" });
+            }
+
+            if (!Mutagen.Bethesda.Plugins.FormKey.TryFactory(baseObjectFormKey, out var baseKey))
+            {
+                return Result<string>.Fail(
+                    $"Invalid base object FormKey format: {baseObjectFormKey}",
+                    suggestions: new List<string> { "Use format: PluginName.esp:0x000800" });
+            }
+
+            if (!outputPluginName.EndsWith(".esp", StringComparison.OrdinalIgnoreCase) &&
+                !outputPluginName.EndsWith(".esl", StringComparison.OrdinalIgnoreCase))
+            {
+                outputPluginName += ".esp";
+            }
+
+            var outputModKey = ModKey.FromFileName(outputPluginName);
+            var existingOutputPath = Path.Combine(dataFolder, outputPluginName);
+
+            // Append to the patch if it already exists, so multiple placements can be
+            // added across separate invocations instead of overwriting each other.
+            var patchMod = File.Exists(existingOutputPath)
+                ? SkyrimMod.CreateFromBinary(existingOutputPath, SkyrimRelease.SkyrimSE)
+                : new SkyrimMod(outputModKey, SkyrimRelease.SkyrimSE);
+
+            // Build a typed link cache in real load order. Order matters: the cell context
+            // must resolve to the WINNING override (e.g. JK's Jorrvaskr's version of the
+            // cell), not Skyrim.esm's, otherwise the override we emit would carry vanilla
+            // cell data and clobber whatever mod currently owns the cell record.
+            var loadOrderListings = new List<IModListingGetter<ISkyrimModGetter>>();
+            var pluginsTxt = Path.Combine(dataFolder, "plugins.txt");
+
+            if (File.Exists(pluginsTxt))
+            {
+                foreach (var rawLine in File.ReadAllLines(pluginsTxt))
+                {
+                    var line = rawLine.Trim().TrimStart('*').Trim();
+                    if (string.IsNullOrWhiteSpace(line) || line.StartsWith("#")) continue;
+
+                    var pluginPath = Path.Combine(dataFolder, line);
+                    if (!File.Exists(pluginPath))
+                    {
+                        _logger.Warning($"Plugin listed in plugins.txt not found, skipping: {line}");
+                        continue;
+                    }
+
+                    var listingMod = SkyrimMod.CreateFromBinaryOverlay(pluginPath, SkyrimRelease.SkyrimSE);
+                    loadOrderListings.Add(new ModListing<ISkyrimModGetter>(listingMod, true));
+                }
+            }
+
+            if (loadOrderListings.Count == 0)
+            {
+                return Result<string>.Fail(
+                    "No load order could be built",
+                    $"Expected a plugins.txt listing the relevant plugins in load order inside: {dataFolder}",
+                    new List<string>
+                    {
+                        "Create a plugins.txt in the data folder listing masters and mods in load order",
+                        "The cell's owning plugin must be included so the winning override resolves correctly"
+                    });
+            }
+
+            var linkCache = loadOrderListings.ToImmutableLinkCache();
+
+            if (!linkCache.TryResolveContext<ICell, ICellGetter>(cellKey, out var cellContext))
+            {
+                return Result<string>.Fail(
+                    $"Cell not found in the provided load order: {cellFormKey}",
+                    suggestions: new List<string>
+                    {
+                        "Verify the cell FormKey is correct",
+                        "Ensure the plugin owning the cell is listed in plugins.txt"
+                    });
+            }
+            var cellOverride = cellContext.GetOrAddAsOverride(patchMod);
+
+            var newRef = new PlacedObject(patchMod.GetNextFormKey(), SkyrimRelease.SkyrimSE);
+            newRef.Base.SetTo(baseKey);
+            newRef.Placement = new Placement
+            {
+                Position = new P3Float(posX, posY, posZ),
+                Rotation = new P3Float(rotX, rotY, rotZ)
+            };
+            newRef.Scale = scale;
+
+            cellOverride.Temporary.Add(newRef);
+
+            if (baseKey.ModKey != patchMod.ModKey &&
+                !patchMod.ModHeader.MasterReferences.Any(m => m.Master == baseKey.ModKey))
+            {
+                patchMod.ModHeader.MasterReferences.Add(new MasterReference { Master = baseKey.ModKey });
+            }
+
+            if (light)
+            {
+                patchMod.ModHeader.Flags |= SkyrimModHeader.HeaderFlag.Small;
+            }
+
+            var outputPath = Path.Combine(dataFolder, outputPluginName);
+            patchMod.WriteToBinary(outputPath);
+
+            _logger.Info($"Added placed object {newRef.FormKey} to {outputPath}");
+            return Result<string>.Ok(outputPath);
+        }
+        catch (Exception ex)
+        {
+            return Result<string>.Fail($"Failed to add placed object: {ex.Message}", ex.StackTrace);
+        }
+    }
+
+    /// <summary>
+    /// Build a typed link cache from a plugins.txt-ordered folder, so records resolve
+    /// to their WINNING override rather than whichever plugin happens to be read first.
+    /// </summary>
+    private Result<ILinkCache<ISkyrimMod, ISkyrimModGetter>> BuildOrderedLinkCache(
+        string dataFolder,
+        string? excludePluginName = null)
+    {
+        var listings = new List<IModListingGetter<ISkyrimModGetter>>();
+        var pluginsTxt = Path.Combine(dataFolder, "plugins.txt");
+
+        if (!File.Exists(pluginsTxt))
+        {
+            return Result<ILinkCache<ISkyrimMod, ISkyrimModGetter>>.Fail(
+                "plugins.txt not found",
+                $"Expected a load order listing at: {pluginsTxt}");
+        }
+
+        foreach (var rawLine in File.ReadAllLines(pluginsTxt))
+        {
+            var line = rawLine.Trim().TrimStart('*').Trim();
+            if (string.IsNullOrWhiteSpace(line) || line.StartsWith("#")) continue;
+
+            // Never memory-map the plugin we are about to write to - the binary overlay
+            // holds an open handle and the subsequent write would fail with a file lock.
+            if (!string.IsNullOrEmpty(excludePluginName) &&
+                string.Equals(line, excludePluginName, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var pluginPath = Path.Combine(dataFolder, line);
+            if (!File.Exists(pluginPath))
+            {
+                _logger.Warning($"Plugin listed in plugins.txt not found, skipping: {line}");
+                continue;
+            }
+
+            var listingMod = SkyrimMod.CreateFromBinaryOverlay(pluginPath, SkyrimRelease.SkyrimSE);
+            listings.Add(new ModListing<ISkyrimModGetter>(listingMod, true));
+        }
+
+        if (listings.Count == 0)
+        {
+            return Result<ILinkCache<ISkyrimMod, ISkyrimModGetter>>.Fail("No plugins could be loaded from plugins.txt");
+        }
+
+        return Result<ILinkCache<ISkyrimMod, ISkyrimModGetter>>.Ok(listings.ToImmutableLinkCache());
+    }
+
+    /// <summary>
+    /// Copy an existing placed object reference into a patch as an override, optionally
+    /// changing its base object, scale, position and rotation. The winning version of the
+    /// reference (per the folder's plugins.txt load order) is used as the starting point,
+    /// so this can be used to "bake in" another mod's edits before removing that mod.
+    /// </summary>
+    public Result<string> OverridePlacedObject(
+        string dataFolder,
+        string refFormKey,
+        string outputPluginName,
+        string? newBaseFormKey = null,
+        float? scale = null,
+        (float X, float Y, float Z)? position = null,
+        (float X, float Y, float Z)? rotation = null,
+        bool light = false)
+    {
+        try
+        {
+            if (!Mutagen.Bethesda.Plugins.FormKey.TryFactory(refFormKey, out var refKey))
+            {
+                return Result<string>.Fail(
+                    $"Invalid reference FormKey format: {refFormKey}",
+                    suggestions: new List<string> { "Use format: 078039:Skyrim.esm" });
+            }
+
+            if (!outputPluginName.EndsWith(".esp", StringComparison.OrdinalIgnoreCase) &&
+                !outputPluginName.EndsWith(".esl", StringComparison.OrdinalIgnoreCase))
+            {
+                outputPluginName += ".esp";
+            }
+
+            var outputModKey = ModKey.FromFileName(outputPluginName);
+            var outputPath = Path.Combine(dataFolder, outputPluginName);
+
+            var patchMod = File.Exists(outputPath)
+                ? SkyrimMod.CreateFromBinary(outputPath, SkyrimRelease.SkyrimSE)
+                : new SkyrimMod(outputModKey, SkyrimRelease.SkyrimSE);
+
+            var cacheResult = BuildOrderedLinkCache(dataFolder, outputPluginName);
+            if (!cacheResult.Success)
+            {
+                return Result<string>.Fail(cacheResult.Error ?? "Failed to build link cache", cacheResult.ErrorContext);
+            }
+
+            if (!cacheResult.Value!.TryResolveContext<IPlacedObject, IPlacedObjectGetter>(refKey, out var refContext))
+            {
+                return Result<string>.Fail(
+                    $"Placed object not found in load order: {refFormKey}",
+                    suggestions: new List<string>
+                    {
+                        "Verify the reference FormKey",
+                        "Ensure the owning plugin is listed in plugins.txt"
+                    });
+            }
+
+            // Pulls in the parent cell override automatically.
+            var refOverride = refContext.GetOrAddAsOverride(patchMod);
+
+            if (!string.IsNullOrWhiteSpace(newBaseFormKey))
+            {
+                if (!Mutagen.Bethesda.Plugins.FormKey.TryFactory(newBaseFormKey, out var baseKey))
+                {
+                    return Result<string>.Fail($"Invalid base FormKey format: {newBaseFormKey}");
+                }
+                refOverride.Base.SetTo(baseKey);
+            }
+
+            if (scale.HasValue)
+            {
+                refOverride.Scale = scale.Value;
+            }
+
+            if (position.HasValue || rotation.HasValue)
+            {
+                refOverride.Placement ??= new Placement();
+                if (position.HasValue)
+                {
+                    refOverride.Placement.Position = new P3Float(position.Value.X, position.Value.Y, position.Value.Z);
+                }
+                if (rotation.HasValue)
+                {
+                    refOverride.Placement.Rotation = new P3Float(rotation.Value.X, rotation.Value.Y, rotation.Value.Z);
+                }
+            }
+
+            if (light)
+            {
+                patchMod.ModHeader.Flags |= SkyrimModHeader.HeaderFlag.Small;
+            }
+
+            patchMod.WriteToBinary(outputPath);
+
+            _logger.Info($"Overrode placed object {refKey} in {outputPath}");
+            return Result<string>.Ok(outputPath);
+        }
+        catch (Exception ex)
+        {
+            return Result<string>.Fail($"Failed to override placed object: {ex.Message}", ex.StackTrace);
+        }
+    }
+
+    /// <summary>
+    /// Remove a placed object reference from a plugin by FormKey.
+    /// </summary>
+    public Result<string> RemovePlacedObject(string pluginPath, string formKeyStr)
+    {
+        try
+        {
+            if (!File.Exists(pluginPath))
+            {
+                return Result<string>.Fail($"Plugin not found: {pluginPath}");
+            }
+
+            if (!Mutagen.Bethesda.Plugins.FormKey.TryFactory(formKeyStr, out var formKey))
+            {
+                return Result<string>.Fail(
+                    $"Invalid FormKey format: {formKeyStr}",
+                    suggestions: new List<string> { "Use format: 000800:MyPatch.esp" });
+            }
+
+            var mod = SkyrimMod.CreateFromBinary(pluginPath, SkyrimRelease.SkyrimSE);
+
+            bool removed = false;
+            foreach (var block in mod.Cells)
+            {
+                foreach (var subBlock in block.SubBlocks)
+                {
+                    foreach (var cell in subBlock.Cells)
+                    {
+                        if (cell.Temporary.Any(r => r.FormKey == formKey))
+                        {
+                            cell.Temporary.RemoveWhere(r => r.FormKey == formKey);
+                            removed = true;
+                        }
+                        if (cell.Persistent.Any(r => r.FormKey == formKey))
+                        {
+                            cell.Persistent.RemoveWhere(r => r.FormKey == formKey);
+                            removed = true;
+                        }
+                    }
+                }
+            }
+
+            if (!removed)
+            {
+                return Result<string>.Fail(
+                    $"Placed object {formKeyStr} not found in {Path.GetFileName(pluginPath)}",
+                    suggestions: new List<string> { "Use 'esp list-records' to see what the plugin contains" });
+            }
+
+            mod.WriteToBinary(pluginPath);
+
+            _logger.Info($"Removed placed object {formKeyStr} from {pluginPath}");
+            return Result<string>.Ok(pluginPath);
+        }
+        catch (Exception ex)
+        {
+            return Result<string>.Fail($"Failed to remove placed object: {ex.Message}", ex.StackTrace);
+        }
+    }
+
+    /// <summary>
     /// Create an override record with optional modifications
     /// Overrides keep the same FormKey as the source record
     /// </summary>
@@ -1961,7 +2583,14 @@ public class PluginService
 
                     if (!string.IsNullOrEmpty(recordType))
                     {
-                        recordsToSearch = FilterByRecordType(mod, recordType);
+                        var filtered = FilterByRecordType(mod, recordType);
+                        if (filtered == null)
+                        {
+                            return Result<List<RecordSearchResult>>.Fail(
+                                $"Unknown record type '{recordType}'.",
+                                null, KnownRecordTypes.Select(t => $"Try --type {t}").ToList());
+                        }
+                        recordsToSearch = filtered;
                     }
 
                     foreach (var record in recordsToSearch)
@@ -2065,9 +2694,16 @@ public class PluginService
             }
             else if (!string.IsNullOrEmpty(searchPattern))
             {
-                IEnumerable<IMajorRecordGetter> allRecords = string.IsNullOrEmpty(recordType)
+                IEnumerable<IMajorRecordGetter>? allRecords = string.IsNullOrEmpty(recordType)
                     ? sourceMod.EnumerateMajorRecords()
                     : FilterByRecordType(sourceMod, recordType);
+
+                if (allRecords == null)
+                {
+                    return Result<BatchOverrideResult>.Fail(
+                        $"Unknown record type '{recordType}'.",
+                        null, KnownRecordTypes.Select(t => $"Try --type {t}").ToList());
+                }
 
                 foreach (var record in allRecords)
                 {
@@ -2114,28 +2750,391 @@ public class PluginService
     }
 
     /// <summary>
+    /// Remove Papyrus script data (VMAD) from one or more records, creating an override patch.
+    /// Works on any record type that carries a VirtualMachineAdapter (Book, Weapon, Armor, NPC,
+    /// Container, Activator, etc.) - anything implementing Mutagen's IHaveVirtualMachineAdapter.
+    /// Records matched by the filter that don't carry script data, or don't have the named script,
+    /// are skipped and reported separately rather than failing the whole batch.
+    /// </summary>
+    /// <param name="scriptName">
+    /// If set, only script entries whose Name matches (case-insensitive) are removed - other
+    /// scripts on the same record are left alone. If null/empty, the record's entire
+    /// VirtualMachineAdapter (all attached scripts) is stripped.
+    /// </param>
+    public Result<BatchRemoveScriptResult> RemoveScript(
+        string sourcePluginPath,
+        string? recordType,
+        string? searchPattern,
+        string[]? editorIds,
+        string? scriptName,
+        string outputPluginName,
+        string? dataFolder = null,
+        bool light = false)
+    {
+        try
+        {
+            if (!File.Exists(sourcePluginPath))
+            {
+                return Result<BatchRemoveScriptResult>.Fail($"Source plugin not found: {sourcePluginPath}");
+            }
+
+            var sourceMod = SkyrimMod.CreateFromBinaryOverlay(sourcePluginPath, SkyrimRelease.SkyrimSE);
+
+            if (!outputPluginName.EndsWith(".esp", StringComparison.OrdinalIgnoreCase) &&
+                !outputPluginName.EndsWith(".esl", StringComparison.OrdinalIgnoreCase))
+            {
+                outputPluginName += ".esp";
+            }
+
+            var outputModKey = ModKey.FromFileName(outputPluginName);
+            var patchMod = new SkyrimMod(outputModKey, SkyrimRelease.SkyrimSE);
+
+            patchMod.ModHeader.MasterReferences.Add(new MasterReference
+            {
+                Master = sourceMod.ModKey
+            });
+
+            var recordsToPatch = new List<IMajorRecordGetter>();
+
+            if (editorIds != null && editorIds.Length > 0)
+            {
+                foreach (var editorId in editorIds)
+                {
+                    var findResult = FindRecordByEditorId(sourceMod, editorId, recordType ?? "");
+                    if (findResult.Success && findResult.Value != null)
+                    {
+                        recordsToPatch.Add(findResult.Value);
+                    }
+                }
+            }
+            else if (!string.IsNullOrEmpty(searchPattern))
+            {
+                IEnumerable<IMajorRecordGetter>? allRecords = string.IsNullOrEmpty(recordType)
+                    ? sourceMod.EnumerateMajorRecords()
+                    : FilterByRecordType(sourceMod, recordType);
+
+                if (allRecords == null)
+                {
+                    return Result<BatchRemoveScriptResult>.Fail(
+                        $"Unknown record type '{recordType}'.",
+                        null, KnownRecordTypes.Select(t => $"Try --type {t}").ToList());
+                }
+
+                foreach (var record in allRecords)
+                {
+                    if (searchPattern == "*" ||
+                        record.EditorID?.Contains(searchPattern, StringComparison.OrdinalIgnoreCase) == true)
+                    {
+                        recordsToPatch.Add(record);
+                    }
+                }
+            }
+            else
+            {
+                return Result<BatchRemoveScriptResult>.Fail(
+                    "Must provide either --editor-ids or --search",
+                    suggestions: new List<string>
+                    {
+                        "Use --editor-ids \"Id1,Id2\" for specific records",
+                        "Use --search \"pattern\" --type <type> to match many records"
+                    });
+            }
+
+            if (recordsToPatch.Count == 0)
+            {
+                return Result<BatchRemoveScriptResult>.Fail("No matching records found");
+            }
+
+            var modifiedRecords = new List<string>();
+            var skippedRecords = new List<string>();
+            var totalScriptsRemoved = 0;
+
+            foreach (var record in recordsToPatch)
+            {
+                var recordLabel = record.EditorID ?? record.FormKey.ToString();
+
+                if (record is not IHaveVirtualMachineAdapterGetter sourceVmaGetter ||
+                    sourceVmaGetter.VirtualMachineAdapter == null)
+                {
+                    skippedRecords.Add($"{recordLabel} (no script data)");
+                    continue;
+                }
+
+                var overrideResult = CreateOverrideRecord(patchMod, record, false);
+                if (!overrideResult.Success || overrideResult.Value == null)
+                {
+                    skippedRecords.Add($"{recordLabel} (unsupported record type)");
+                    continue;
+                }
+
+                // IHaveVirtualMachineAdapter only exposes a getter - the concrete record types
+                // (Book, Weapon, Armor, Npc, ...) have the real settable property, but there's no
+                // shared settable interface for it. Reflection lets this work generically across
+                // every record type CreateOverrideRecord supports instead of hand-casing each one.
+                var majorRecord = overrideResult.Value;
+                var vmaProperty = majorRecord.GetType().GetProperty("VirtualMachineAdapter");
+                if (vmaProperty?.GetValue(majorRecord) is not AVirtualMachineAdapter currentVma)
+                {
+                    skippedRecords.Add($"{recordLabel} (no script data)");
+                    continue;
+                }
+
+                if (string.IsNullOrEmpty(scriptName))
+                {
+                    totalScriptsRemoved += currentVma.Scripts?.Count ?? 0;
+                    vmaProperty.SetValue(majorRecord, null);
+                }
+                else
+                {
+                    var scripts = currentVma.Scripts;
+                    if (scripts == null || scripts.Count == 0)
+                    {
+                        skippedRecords.Add($"{recordLabel} (no script data)");
+                        continue;
+                    }
+
+                    var indicesToRemove = new List<int>();
+                    for (var i = 0; i < scripts.Count; i++)
+                    {
+                        if (string.Equals(scripts[i].Name, scriptName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            indicesToRemove.Add(i);
+                        }
+                    }
+
+                    if (indicesToRemove.Count == 0)
+                    {
+                        skippedRecords.Add($"{recordLabel} (script '{scriptName}' not found)");
+                        continue;
+                    }
+
+                    foreach (var index in indicesToRemove.OrderByDescending(i => i))
+                    {
+                        scripts.RemoveAt(index);
+                    }
+
+                    totalScriptsRemoved += indicesToRemove.Count;
+
+                    if (scripts.Count == 0)
+                    {
+                        vmaProperty.SetValue(majorRecord, null);
+                    }
+                }
+
+                modifiedRecords.Add(recordLabel);
+            }
+
+            if (modifiedRecords.Count == 0)
+            {
+                return Result<BatchRemoveScriptResult>.Fail(
+                    "No records were modified - every matched record was skipped",
+                    suggestions: skippedRecords.Take(5).ToList());
+            }
+
+            if (light)
+            {
+                patchMod.ModHeader.Flags |= SkyrimModHeader.HeaderFlag.Small;
+            }
+
+            var outputDir = !string.IsNullOrEmpty(dataFolder)
+                ? dataFolder
+                : Path.GetDirectoryName(sourcePluginPath) ?? Directory.GetCurrentDirectory();
+
+            var outputPath = Path.Combine(outputDir, outputPluginName);
+
+            patchMod.WriteToBinary(outputPath);
+
+            _logger.Info(
+                $"Created script-removal patch: {outputPath} ({modifiedRecords.Count} record(s), {totalScriptsRemoved} script(s) removed)");
+
+            return Result<BatchRemoveScriptResult>.Ok(new BatchRemoveScriptResult
+            {
+                RecordsModified = modifiedRecords.Count,
+                ScriptsRemoved = totalScriptsRemoved,
+                ModifiedRecords = modifiedRecords,
+                SkippedRecords = skippedRecords,
+                PatchPath = outputPath
+            });
+        }
+        catch (Exception ex)
+        {
+            return Result<BatchRemoveScriptResult>.Fail($"Failed to remove script: {ex.Message}", ex.StackTrace);
+        }
+    }
+
+    /// <summary>
+    /// Batch create overrides for multiple weapon records, appending a suffix to their display Name.
+    /// Records that can't be found or aren't weapons are skipped (reported separately from modified).
+    /// </summary>
+    public Result<BatchOverrideResult> BatchAppendNameSuffix(
+        string sourcePluginPath,
+        string[] editorIds,
+        string recordType,
+        string suffix,
+        string outputPluginName,
+        string? dataFolder = null)
+    {
+        try
+        {
+            if (!File.Exists(sourcePluginPath))
+            {
+                return Result<BatchOverrideResult>.Fail($"Source plugin not found: {sourcePluginPath}");
+            }
+
+            var sourceMod = SkyrimMod.CreateFromBinaryOverlay(sourcePluginPath, SkyrimRelease.SkyrimSE);
+
+            if (!outputPluginName.EndsWith(".esp", StringComparison.OrdinalIgnoreCase) &&
+                !outputPluginName.EndsWith(".esl", StringComparison.OrdinalIgnoreCase))
+            {
+                outputPluginName += ".esp";
+            }
+
+            var outputModKey = ModKey.FromFileName(outputPluginName);
+            var patchMod = new SkyrimMod(outputModKey, SkyrimRelease.SkyrimSE);
+
+            patchMod.ModHeader.MasterReferences.Add(new MasterReference
+            {
+                Master = sourceMod.ModKey
+            });
+
+            var modifiedRecords = new List<string>();
+            var skipped = new List<string>();
+
+            foreach (var editorId in editorIds)
+            {
+                var findResult = FindRecordByEditorId(sourceMod, editorId, recordType);
+                if (!findResult.Success || findResult.Value == null)
+                {
+                    skipped.Add(editorId);
+                    continue;
+                }
+
+                if (findResult.Value is not IWeaponGetter weapon)
+                {
+                    skipped.Add(editorId);
+                    continue;
+                }
+
+                var weaponOverride = (Weapon)weapon.DeepCopy();
+                var currentName = weaponOverride.Name?.String ?? "";
+                weaponOverride.Name = currentName + suffix;
+                patchMod.Weapons.Add(weaponOverride);
+                modifiedRecords.Add(editorId);
+            }
+
+            var outputDir = !string.IsNullOrEmpty(dataFolder)
+                ? dataFolder
+                : Path.GetDirectoryName(sourcePluginPath) ?? Directory.GetCurrentDirectory();
+
+            var outputPath = Path.Combine(outputDir, outputPluginName);
+
+            patchMod.WriteToBinary(outputPath);
+
+            _logger.Info($"Created batch rename patch: {outputPath}");
+
+            if (skipped.Count > 0)
+            {
+                _logger.Info($"Skipped {skipped.Count} EditorID(s) not found or not weapons: {string.Join(", ", skipped)}");
+            }
+
+            return Result<BatchOverrideResult>.Ok(new BatchOverrideResult
+            {
+                RecordsModified = modifiedRecords.Count,
+                ModifiedRecords = modifiedRecords,
+                PatchPath = outputPath
+            });
+        }
+        catch (Exception ex)
+        {
+            return Result<BatchOverrideResult>.Fail(
+                $"Failed to create batch rename: {ex.Message}",
+                ex.StackTrace);
+        }
+    }
+
+    /// <summary>
     /// Filter records by type
     /// </summary>
-    private IEnumerable<IMajorRecordGetter> FilterByRecordType(ISkyrimModGetter mod, string recordType)
+    /// <summary>
+    /// Record type names accepted by --type, for error messages.
+    /// </summary>
+    public static readonly string[] KnownRecordTypes =
+    {
+        "spell", "weapon", "armor", "armoraddon", "quest", "npc", "perk", "faction", "book",
+        "miscitem", "global", "leveleditem", "levelednpc", "formlist", "outfit", "location",
+        "encounterzone", "magiceffect", "ingestible", "ingredient", "keyword", "container",
+        "cell", "worldspace", "objecteffect", "constructibleobject", "soulgem", "ammunition",
+        "scroll", "activator", "door", "flora", "furniture", "light", "static", "idle",
+        "shout", "wordofpower", "race", "class", "headpart", "sound", "explosion", "projectile",
+        "region", "impactdataset", "texture", "message", "packagelist", "combatstyle", "package"
+    };
+
+    /// <summary>
+    /// Resolves a --type name to the matching record group.
+    ///
+    /// Returns null for an unrecognised type so the caller can report it. This used to fall
+    /// through to EnumerateMajorRecords(), which silently returned EVERY record in the plugin -
+    /// so a typo, or any type that simply wasn't in the list, looked like a successful query
+    /// with an absurd result (--type MGEF against Skyrim.esm reported 869,687 "matches"). A
+    /// filter that silently ignores the filter is worse than one that refuses.
+    ///
+    /// Names are matched case-insensitively, and the common record-signature spellings (MGEF,
+    /// ALCH, KYWD...) are accepted alongside the long names, since that's what people actually
+    /// type when reading xEdit or the wiki.
+    /// </summary>
+    private IEnumerable<IMajorRecordGetter>? FilterByRecordType(ISkyrimModGetter mod, string recordType)
     {
         return recordType.ToLowerInvariant() switch
         {
-            "spell" => mod.Spells,
-            "weapon" => mod.Weapons,
-            "armor" => mod.Armors,
-            "quest" => mod.Quests,
-            "npc" => mod.Npcs,
+            "spell" or "spel" => mod.Spells,
+            "weapon" or "weap" => mod.Weapons,
+            "armor" or "armo" => mod.Armors,
+            "armoraddon" or "arma" => mod.ArmorAddons,
+            "quest" or "qust" => mod.Quests,
+            "npc" or "npc_" => mod.Npcs,
             "perk" => mod.Perks,
-            "faction" => mod.Factions,
-            "book" => mod.Books,
-            "miscitem" => mod.MiscItems,
-            "global" => mod.Globals,
-            "leveleditem" => mod.LeveledItems,
-            "formlist" => mod.FormLists,
-            "outfit" => mod.Outfits,
-            "location" => mod.Locations,
-            "encounterzone" => mod.EncounterZones,
-            _ => mod.EnumerateMajorRecords()
+            "faction" or "fact" => mod.Factions,
+            "book" or "book_" => mod.Books,
+            "miscitem" or "misc" => mod.MiscItems,
+            "global" or "glob" => mod.Globals,
+            "leveleditem" or "lvli" => mod.LeveledItems,
+            "levelednpc" or "lvln" => mod.LeveledNpcs,
+            "formlist" or "flst" => mod.FormLists,
+            "outfit" or "otft" => mod.Outfits,
+            "location" or "lctn" => mod.Locations,
+            "encounterzone" or "eczn" => mod.EncounterZones,
+            "magiceffect" or "mgef" => mod.MagicEffects,
+            "ingestible" or "alch" or "potion" => mod.Ingestibles,
+            "ingredient" or "ingr" => mod.Ingredients,
+            "keyword" or "kywd" => mod.Keywords,
+            "container" or "cont" => mod.Containers,
+            "objecteffect" or "ench" or "enchantment" => mod.ObjectEffects,
+            "constructibleobject" or "cobj" or "recipe" => mod.ConstructibleObjects,
+            "soulgem" or "slgm" => mod.SoulGems,
+            "ammunition" or "ammo" => mod.Ammunitions,
+            "scroll" or "scrl" => mod.Scrolls,
+            "activator" or "acti" => mod.Activators,
+            "door" => mod.Doors,
+            "flora" => mod.Florae,
+            "furniture" or "furn" => mod.Furniture,
+            "light" or "ligh" => mod.Lights,
+            "static" or "stat" => mod.Statics,
+            "idle" or "idlm" => mod.IdleMarkers,
+            "shout" or "shou" => mod.Shouts,
+            "wordofpower" or "wood" => mod.WordsOfPower,
+            "race" => mod.Races,
+            "class" or "clas" => mod.Classes,
+            "headpart" or "hdpt" => mod.HeadParts,
+            "sound" or "soun" => mod.SoundMarkers,
+            "explosion" or "expl" => mod.Explosions,
+            "projectile" or "proj" => mod.Projectiles,
+            "region" or "regn" => mod.Regions,
+            "impactdataset" or "ipds" => mod.ImpactDataSets,
+            "texture" or "txst" or "textureset" => mod.TextureSets,
+            "message" or "mesg" => mod.Messages,
+            "combatstyle" or "csty" => mod.CombatStyles,
+            "package" or "pack" => mod.Packages,
+            _ => null
         };
     }
 
@@ -2780,7 +3779,13 @@ public class PluginService
                 || TryRemoveFromGroup(mod.Outfits, editorId)
                 || TryRemoveFromGroup(mod.Locations, editorId)
                 || TryRemoveFromGroup(mod.EncounterZones, editorId)
-                || TryRemoveFromGroup(mod.Packages, editorId);
+                || TryRemoveFromGroup(mod.Packages, editorId)
+                || TryRemoveFromGroup(mod.ObjectEffects, editorId)
+                || TryRemoveFromGroup(mod.MagicEffects, editorId)
+                || TryRemoveFromGroup(mod.Keywords, editorId)
+                || TryRemoveFromGroup(mod.ArmorAddons, editorId)
+                || TryRemoveFromGroup(mod.Containers, editorId)
+                || TryRemoveFromGroup(mod.ConstructibleObjects, editorId);
 
             if (!removed)
             {
@@ -2931,7 +3936,8 @@ public class PluginService
         Quest quest,
         string aliasName,
         string? scriptName = null,
-        QuestAlias.Flag? flags = null)
+        QuestAlias.Flag? flags = null,
+        string? forcedReference = null)
     {
         if (quest.Aliases.Any(a => a.Name == aliasName))
         {
@@ -2947,6 +3953,21 @@ public class PluginService
             Name = aliasName,
             Flags = flags
         };
+
+        // A forced reference (ALFR) pins the alias to a specific placed reference - most
+        // commonly the player (000014:Skyrim.esm). Without any fill method an alias can fail
+        // to fill, which in Skyrim can stop the whole quest from starting, so this matters for
+        // "always-on" utility quests (e.g. an MCM config quest using SKI_PlayerLoadGameAlias).
+        if (!string.IsNullOrWhiteSpace(forcedReference))
+        {
+            if (!FormKey.TryFactory(forcedReference, out var refKey))
+            {
+                return Result<QuestAlias>.Fail(
+                    $"Invalid forced reference FormKey: '{forcedReference}'. Expected 'FORMID:MODNAME' with 6 hex digits, e.g. '000014:Skyrim.esm'.");
+            }
+            alias.ForcedReference.SetTo(refKey);
+        }
+
         quest.Aliases.Add(alias);
 
         if (!string.IsNullOrEmpty(scriptName))

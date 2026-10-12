@@ -2,6 +2,8 @@
 
 **Purpose:** Comprehensive technical reference for workflow patterns and advanced features
 
+**Fallout extensions:** `fo4` handles Fallout 4 ESP operations ([reference](fallout4.md)). `f4se create/info/build` handles C++ DLL starters for VR 1.2.72 and legacy desktop 1.10.163 ([SDK paths and workflow](f4se.md)). `esp` and `skse` remain Skyrim-specific. Successful DLL builds include mock-host checks, not in-game validation; do not report game compatibility as tested until the game load is verified.
+
 ---
 
 ## About This Guide
@@ -34,6 +36,15 @@ dotnet run --project src/SpookysAutomod.Cli -- esp info "MyMod.esp" --json
 ```
 
 ---
+
+## Flagging and Compacting an Existing Plugin as ESL
+
+Use esp flag-light when every plugin-owned local FormID is already within 0x000-0xFFF. It changes only the header flag in a staged copy. If any owned IDs exceed the range, use esp compact-light, which remaps those IDs and internal links before flagging.
+
+    dotnet run --project src/SpookysAutomod.Cli -- esp flag-light "source/MyMod.esp" --output "staging/MyMod.esp" --json
+    dotnet run --project src/SpookysAutomod.Cli -- esp compact-light "source/MyMod.esp" --output "staging/MyMod.esp" --json
+
+Both commands preserve the source and require the output to keep the same filename. Compaction changes plugin-owned FormIDs, so review the emitted mapping and account for existing saves, scripts, patches, and dependent files before deployment. Reopen/validation output is not a substitute for checking external references.
 
 ## Creating New Mods
 
